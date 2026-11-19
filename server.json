@@ -1,0 +1,21 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.inchTodd/surinch-db-guard-mcp",
+  "description": "Local-first, zero-dependency deterministic DDL governance scorer, SQL readonly safety gate, metadata-only sensitive masking scanner, and SHA-256 verifiable receipt MCP server for MySQL, PostgreSQL, and Apache Doris.",
+  "repository": {
+    "url": "https://github.com/inchTodd/surinch-db-guard-mcp",
+    "source": "github"
+  },
+  "version": "0.1.0",
+  "packages": [
+    {
+      "registryType": "npm",
+      "registryBaseUrl": "https://registry.npmjs.org",
+      "identifier": "@surinch/db-guard-mcp",
+      "version": "0.1.0",
+      "transport": {
+        "type": "stdio"
+      }
+    }
+  ]
+}
