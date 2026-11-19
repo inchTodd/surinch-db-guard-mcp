@@ -8,9 +8,9 @@
     "node": ">=20.0.0"
   },
   "bin": {
-    "db-guard-mcp": "./bin/mcp-server.mjs",
-    "surinch-db-guard": "./bin/cli.mjs",
-    "surinch-db-guard-mcp": "./bin/mcp-server.mjs"
+    "db-guard-mcp": "bin/mcp-server.mjs",
+    "surinch-db-guard": "bin/cli.mjs",
+    "surinch-db-guard-mcp": "bin/mcp-server.mjs"
   },
   "exports": {
     ".": "./src/index.mjs"
@@ -43,7 +43,7 @@
   "author": "Shanghai Surinch Network Technology Co., Ltd. (https://surinch.com)",
   "repository": {
     "type": "git",
-    "url": "https://github.com/inchTodd/surinch-db-guard-mcp.git"
+    "url": "git+https://github.com/inchTodd/surinch-db-guard-mcp.git"
   },
   "bugs": {
     "url": "https://github.com/inchTodd/surinch-db-guard-mcp/issues"
