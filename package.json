@@ -1,0 +1,51 @@
+{
+  "name": "@surinch/db-guard-mcp",
+  "version": "0.1.0",
+  "description": "Local-first, zero-dependency deterministic DDL governance scorer, SQL readonly safety reviewer, metadata-only sensitive masking scanner, and SHA-256 verifiable receipt CLI & MCP Server for MySQL, PostgreSQL, and Apache Doris.",
+  "type": "module",
+  "license": "Apache-2.0",
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "bin": {
+    "db-guard-mcp": "./bin/mcp-server.mjs",
+    "surinch-db-guard": "./bin/cli.mjs",
+    "surinch-db-guard-mcp": "./bin/mcp-server.mjs"
+  },
+  "exports": {
+    ".": "./src/index.mjs"
+  },
+  "files": [
+    "bin/",
+    "src/",
+    "README.md",
+    "LICENSE",
+    "NOTICE"
+  ],
+  "scripts": {
+    "test": "node --test test/db-guard.test.mjs"
+  },
+  "keywords": [
+    "mcp",
+    "mcp-server",
+    "database",
+    "ddl",
+    "sql-review",
+    "data-governance",
+    "data-masking",
+    "pii",
+    "postgresql",
+    "mysql",
+    "doris",
+    "surinch"
+  ],
+  "homepage": "https://surinch.com/tools/ddl-governance-check",
+  "author": "Shanghai Surinch Network Technology Co., Ltd. (https://surinch.com)",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/inchTodd/surinch-db-guard-mcp.git"
+  },
+  "bugs": {
+    "url": "https://github.com/inchTodd/surinch-db-guard-mcp/issues"
+  }
+}
