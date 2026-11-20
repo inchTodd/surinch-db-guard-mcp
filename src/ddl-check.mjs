@@ -1,4 +1,6 @@
 import { SUPPORTED_DDL_DIALECTS, parseDdlTables } from './ddl-parser.mjs';
+import { analyzeAlterLockRisks } from './alter-lock-check.mjs';
+import { applyRuleConfig, resolveConfig } from './config.mjs';
 
 const MONEY_NAME_RE = /(?:^|_)(amount|amt|price|fee|cost|balance|pay|revenue|profit|total|gmv|money|salary|tax)(?:$|_)/i;
 const FLOAT_TYPE_RE = /^(?:float|float4|float8|double|double\s+precision|real)\b/i;
@@ -9,7 +11,7 @@ function toSnakeLike(name) {
     return String(name || '').replace(/([a-z0-9])([A-Z])/g, '$1_$2').toLowerCase();
 }
 
-export function analyzeDdlGovernance(rawSql, dialect = 'mysql') {
+export function analyzeDdlGovernance(rawSql, dialect = 'mysql', options = {}) {
     const normalizedDialect = String(dialect || '').trim().toLowerCase();
     if (!SUPPORTED_DDL_DIALECTS.has(normalizedDialect)) {
         return {
@@ -19,18 +21,24 @@ export function analyzeDdlGovernance(rawSql, dialect = 'mysql') {
         };
     }
 
+    const cfgRes = resolveConfig(options?.config);
+    if (!cfgRes.ok) return cfgRes;
+    const config = cfgRes.config;
+
     const trimmed = String(rawSql || '').trim();
     if (!trimmed) {
         return { ok: false, errorCode: 'EMPTY_INPUT', message: 'Input DDL is empty.' };
     }
 
     const parsedTables = parseDdlTables(trimmed, normalizedDialect);
-    if (parsedTables.length === 0) {
-        return { ok: false, errorCode: 'NO_CREATE_TABLE', message: 'No valid CREATE TABLE statement found.' };
+    const alterAnalysis = analyzeAlterLockRisks(trimmed, normalizedDialect);
+
+    if (parsedTables.length === 0 && alterAnalysis.alterStatementCount === 0) {
+        return { ok: false, errorCode: 'NO_CREATE_TABLE', message: 'No valid CREATE TABLE or ALTER TABLE statement found.' };
     }
 
     const tables = [];
-    const findings = [];
+    const rawFindings = [];
     let totalCols = 0;
     let totalCommentedCols = 0;
     let snakeOkCols = 0;
@@ -48,31 +56,89 @@ export function analyzeDdlGovernance(rawSql, dialect = 'mysql') {
         totalCommentedCols += commentedCount;
 
         if (!SNAKE_CASE_RE.test(tableName)) {
-            findings.push({ id: `${tableName}-table-naming`, severity: 'P2', category: '命名规范', target: tableName, message: `Table "${tableName}" is not lowercase snake_case.` });
+            rawFindings.push({
+                id: `${tableName}-table-naming`,
+                ruleCode: 'DDL_TABLE_NAMING',
+                severity: 'P2',
+                category: '命名规范',
+                target: tableName,
+                message: `Table "${tableName}" is not lowercase snake_case.`,
+            });
         }
         if (!hasPk) {
-            findings.push({ id: `${tableName}-missing-pk`, severity: 'P0', category: '主键与约束', target: tableName, message: `Table "${tableName}" has no PRIMARY KEY or Doris data model key.` });
+            rawFindings.push({
+                id: `${tableName}-missing-pk`,
+                ruleCode: 'DDL_MISSING_PK',
+                severity: 'P0',
+                category: '主键与约束',
+                target: tableName,
+                message: `Table "${tableName}" has no PRIMARY KEY or Doris data model key.`,
+            });
         }
         if (!hasTableComment) {
-            findings.push({ id: `${tableName}-missing-table-comment`, severity: 'P1', category: '注释覆盖', target: tableName, message: `Table "${tableName}" is missing a table COMMENT.` });
+            rawFindings.push({
+                id: `${tableName}-missing-table-comment`,
+                ruleCode: 'DDL_MISSING_TABLE_COMMENT',
+                severity: 'P1',
+                category: '注释覆盖',
+                target: tableName,
+                message: `Table "${tableName}" is missing a table COMMENT.`,
+            });
         }
         if (!hasAuditTimestamp && cols.length > 0) {
-            findings.push({ id: `${tableName}-missing-audit-ts`, severity: 'P1', category: '审计与可监控', target: tableName, message: `Table "${tableName}" lacks an audit/freshness timestamp column.` });
+            rawFindings.push({
+                id: `${tableName}-missing-audit-ts`,
+                ruleCode: 'DDL_MISSING_AUDIT_TS',
+                severity: 'P1',
+                category: '审计与可监控',
+                target: tableName,
+                message: `Table "${tableName}" lacks an audit/freshness timestamp column.`,
+            });
         }
 
         for (const col of cols) {
             if (SNAKE_CASE_RE.test(col.name)) snakeOkCols += 1;
-            else findings.push({ id: `${tableName}.${col.name}-naming`, severity: 'P2', category: '命名规范', target: `${tableName}.${col.name}`, message: `Column "${col.name}" is not lowercase snake_case.` });
+            else {
+                rawFindings.push({
+                    id: `${tableName}.${col.name}-naming`,
+                    ruleCode: 'DDL_COLUMN_NAMING',
+                    severity: 'P2',
+                    category: '命名规范',
+                    target: `${tableName}.${col.name}`,
+                    message: `Column "${col.name}" is not lowercase snake_case.`,
+                });
+            }
 
             if (!col.hasInlineComment) {
-                findings.push({ id: `${tableName}.${col.name}-comment`, severity: 'P1', category: '注释覆盖', target: `${tableName}.${col.name}`, message: `Column "${tableName}.${col.name}" is missing a COMMENT.` });
+                rawFindings.push({
+                    id: `${tableName}.${col.name}-comment`,
+                    ruleCode: 'DDL_MISSING_COLUMN_COMMENT',
+                    severity: 'P1',
+                    category: '注释覆盖',
+                    target: `${tableName}.${col.name}`,
+                    message: `Column "${tableName}.${col.name}" is missing a COMMENT.`,
+                });
             }
             if (MONEY_NAME_RE.test(toSnakeLike(col.name)) && FLOAT_TYPE_RE.test(col.rawType)) {
                 totalTypeIssues += 1;
-                findings.push({ id: `${tableName}.${col.name}-float-money`, severity: 'P0', category: '类型精度', target: `${tableName}.${col.name}`, message: `Monetary column "${col.name}" uses floating-point type "${col.rawType}". Use DECIMAL/NUMERIC.` });
+                rawFindings.push({
+                    id: `${tableName}.${col.name}-float-money`,
+                    ruleCode: 'DDL_FLOAT_MONEY',
+                    severity: 'P0',
+                    category: '类型精度',
+                    target: `${tableName}.${col.name}`,
+                    message: `Monetary column "${col.name}" uses floating-point type "${col.rawType}". Use DECIMAL/NUMERIC.`,
+                });
             } else if (normalizedDialect === 'mysql' && /^varchar$/i.test(col.rawType.trim())) {
                 totalTypeIssues += 1;
-                findings.push({ id: `${tableName}.${col.name}-varchar-len`, severity: 'P1', category: '类型精度', target: `${tableName}.${col.name}`, message: `MySQL VARCHAR column "${col.name}" is missing explicit length.` });
+                rawFindings.push({
+                    id: `${tableName}.${col.name}-varchar-len`,
+                    ruleCode: 'DDL_MYSQL_VARCHAR_LEN',
+                    severity: 'P1',
+                    category: '类型精度',
+                    target: `${tableName}.${col.name}`,
+                    message: `MySQL VARCHAR column "${col.name}" is missing explicit length.`,
+                });
             }
         }
 
@@ -87,29 +153,52 @@ export function analyzeDdlGovernance(rawSql, dialect = 'mysql') {
         });
     }
 
-    const safeCols = Math.max(totalCols, 1);
-    const safeTables = Math.max(tables.length, 1);
-    const namingScore = Math.round(((snakeOkCols + tables.filter((t) => SNAKE_CASE_RE.test(t.name)).length) / (safeCols + safeTables)) * 100);
-    const commentScore = Math.round(((totalCommentedCols + tables.filter((t) => t.hasTableComment).length) / (safeCols + safeTables)) * 100);
-    const pkScore = Math.round((tables.filter((t) => t.hasPrimaryKey).length / safeTables) * 100);
-    const monitoringScore = Math.round((tables.filter((t) => t.hasAuditTimestamp).length / safeTables) * 100);
-    const typeScore = Math.max(0, Math.round(100 - (totalTypeIssues / safeCols) * 200));
+    for (const af of alterAnalysis.findings) {
+        rawFindings.push(af);
+    }
 
-    const dimensions = [
-        { key: 'naming', weightPct: 25, score: namingScore, weighted: Number((namingScore * 0.25).toFixed(2)) },
-        { key: 'comments', weightPct: 20, score: commentScore, weighted: Number((commentScore * 0.2).toFixed(2)) },
-        { key: 'primaryKey', weightPct: 20, score: pkScore, weighted: Number((pkScore * 0.2).toFixed(2)) },
-        { key: 'monitoring', weightPct: 20, score: monitoringScore, weighted: Number((monitoringScore * 0.2).toFixed(2)) },
-        { key: 'types', weightPct: 15, score: typeScore, weighted: Number((typeScore * 0.15).toFixed(2)) },
-    ];
-    const totalScore = Math.round(dimensions.reduce((acc, d) => acc + d.weighted, 0));
+    const findings = applyRuleConfig(rawFindings, config);
     const severityRank = { P0: 0, P1: 1, P2: 2 };
     findings.sort((a, b) => severityRank[a.severity] - severityRank[b.severity]);
+
+    const lockFindings = findings.filter((f) => f.category === '锁表风险');
+    const lockPenalty =
+        lockFindings.filter((f) => f.severity === 'P0').length * 25 +
+        lockFindings.filter((f) => f.severity === 'P1').length * 10 +
+        lockFindings.filter((f) => f.severity === 'P2').length * 5;
+
+    let dimensions;
+    let totalScore;
+
+    if (tables.length > 0) {
+        const safeCols = Math.max(totalCols, 1);
+        const safeTables = Math.max(tables.length, 1);
+        const namingScore = Math.round(((snakeOkCols + tables.filter((t) => SNAKE_CASE_RE.test(t.name)).length) / (safeCols + safeTables)) * 100);
+        const commentScore = Math.round(((totalCommentedCols + tables.filter((t) => t.hasTableComment).length) / (safeCols + safeTables)) * 100);
+        const pkScore = Math.round((tables.filter((t) => t.hasPrimaryKey).length / safeTables) * 100);
+        const monitoringScore = Math.round((tables.filter((t) => t.hasAuditTimestamp).length / safeTables) * 100);
+        const typeScore = Math.max(0, Math.round(100 - (totalTypeIssues / safeCols) * 200));
+
+        dimensions = [
+            { key: 'naming', weightPct: 25, score: namingScore, weighted: Number((namingScore * 0.25).toFixed(2)) },
+            { key: 'comments', weightPct: 20, score: commentScore, weighted: Number((commentScore * 0.2).toFixed(2)) },
+            { key: 'primaryKey', weightPct: 20, score: pkScore, weighted: Number((pkScore * 0.2).toFixed(2)) },
+            { key: 'monitoring', weightPct: 20, score: monitoringScore, weighted: Number((monitoringScore * 0.2).toFixed(2)) },
+            { key: 'types', weightPct: 15, score: typeScore, weighted: Number((typeScore * 0.15).toFixed(2)) },
+        ];
+        totalScore = Math.max(0, Math.round(dimensions.reduce((acc, d) => acc + d.weighted, 0)) - lockPenalty);
+    } else {
+        totalScore = Math.max(0, 100 - lockPenalty);
+        dimensions = [
+            { key: 'alterLockSafety', weightPct: 100, score: totalScore, weighted: totalScore },
+        ];
+    }
 
     return {
         ok: true,
         dialect: normalizedDialect,
         tableCount: tables.length,
+        alterStatementCount: alterAnalysis.alterStatementCount,
         columnCount: totalCols,
         totalScore,
         dimensions,

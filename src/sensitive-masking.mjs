@@ -1,4 +1,5 @@
 import { SUPPORTED_DDL_DIALECTS, parseDdlTables } from './ddl-parser.mjs';
+import { isRuleDisabled, resolveConfig, resolveRuleSeverity } from './config.mjs';
 
 const VIEW_PREFIX_RE = /^[a-zA-Z_][a-zA-Z0-9_]*$/;
 
@@ -124,6 +125,10 @@ export function scanSensitiveMasking(rawSql, dialect = 'mysql', options = {}) {
         };
     }
 
+    const cfgRes = resolveConfig(options?.config);
+    if (!cfgRes.ok) return cfgRes;
+    const config = cfgRes.config;
+
     const viewPrefix = options.viewPrefix == null ? 'v_masked_' : String(options.viewPrefix).trim();
     if (!VIEW_PREFIX_RE.test(viewPrefix)) {
         return {
@@ -143,6 +148,11 @@ export function scanSensitiveMasking(rawSql, dialect = 'mysql', options = {}) {
         return { ok: false, errorCode: 'NO_CREATE_TABLE', message: 'No valid CREATE TABLE statement found.' };
     }
 
+    const allRules = [
+        ...(config.customSensitivePatterns || []),
+        ...SENSITIVE_RULES,
+    ];
+
     const findings = [];
     const tables = [];
     const maskingViews = [];
@@ -154,11 +164,21 @@ export function scanSensitiveMasking(rawSql, dialect = 'mysql', options = {}) {
         const tableSensitive = [];
 
         for (const col of pt.columns) {
-            const rule = SENSITIVE_RULES.find((r) => r.nameRe.test(col.name));
+            const rule = allRules.find((r) => {
+                if (!r.nameRe.test(col.name)) return false;
+                const candidate = {
+                    id: `${pt.name}.${col.name}-${r.category.toLowerCase().replace(/[^a-z0-9_]+/g, '_')}`,
+                    ruleCode: r.ruleCode || r.category,
+                    category: r.category,
+                };
+                return !isRuleDisabled(candidate, config);
+            });
             if (rule) {
-                matchedCols.set(col.name, rule);
-                const item = {
-                    id: `${pt.name}.${col.name}-${rule.category.toLowerCase()}`,
+                const ruleCode = rule.ruleCode || rule.category;
+                const id = `${pt.name}.${col.name}-${rule.category.toLowerCase().replace(/[^a-z0-9_]+/g, '_')}`;
+                const baseItem = {
+                    id,
+                    ruleCode,
                     table: pt.name,
                     column: col.name,
                     rawType: col.rawType,
@@ -168,6 +188,11 @@ export function scanSensitiveMasking(rawSql, dialect = 'mysql', options = {}) {
                     strategy: rule.strategy,
                     message: `Sensitive ${rule.level} (${rule.category}) column "${pt.name}.${col.name}": ${rule.rationale}`,
                 };
+                if (rule.custom) baseItem.custom = true;
+                const finalSeverity = resolveRuleSeverity(baseItem, config);
+                const item = finalSeverity === baseItem.severity ? baseItem : { ...baseItem, severity: finalSeverity };
+
+                matchedCols.set(col.name, rule);
                 findings.push(item);
                 tableSensitive.push({
                     column: col.name,
@@ -213,6 +238,9 @@ export function scanSensitiveMasking(rawSql, dialect = 'mysql', options = {}) {
     const l4 = findings.filter((f) => f.level === 'L4').length;
     const l3 = findings.filter((f) => f.level === 'L3').length;
     const l2 = findings.filter((f) => f.level === 'L2').length;
+    const p0 = findings.filter((f) => f.severity === 'P0').length;
+    const p1 = findings.filter((f) => f.severity === 'P1').length;
+    const p2 = findings.filter((f) => f.severity === 'P2').length;
 
     return {
         ok: true,
@@ -228,9 +256,9 @@ export function scanSensitiveMasking(rawSql, dialect = 'mysql', options = {}) {
             l3,
             l2,
             totalSensitive: findings.length,
-            p0: l4,
-            p1: l3,
-            p2: l2,
+            p0,
+            p1,
+            p2,
         },
     };
 }

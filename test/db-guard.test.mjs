@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
@@ -8,6 +9,10 @@ import {
     analyzeDdlGovernance,
     reviewSqlReadonly,
     scanSensitiveMasking,
+    analyzeAlterLockRisks,
+    validateConfig,
+    loadConfigFile,
+    scanDirectoryBatch,
     buildReceipt,
 } from '../src/index.mjs';
 import { handleJsonRpcRequest } from '../bin/mcp-server.mjs';
@@ -253,6 +258,324 @@ test('CLI and MCP stdio subprocesses work end-to-end with proper exit codes', ()
     assert.equal(mcpStdio.status, 0);
     const line = JSON.parse(mcpStdio.stdout.trim());
     assert.equal(line.result.tools.length, 3);
+});
+
+test('ALTER TABLE lock-risk detection catches MySQL and PostgreSQL risks in ddl_governance_check and sql_readonly_review', () => {
+    // --- MySQL positive lock risks ---
+    const mysqlUnsafe = `
+        ALTER TABLE orders_fact MODIFY COLUMN status VARCHAR(64) NOT NULL;
+        ALTER TABLE orders_fact CHANGE COLUMN note remark TEXT;
+        ALTER TABLE orders_fact ADD PRIMARY KEY (order_id);
+        ALTER TABLE orders_fact ADD CONSTRAINT fk_cust FOREIGN KEY (customer_id) REFERENCES customer_profile(customer_id);
+        ALTER TABLE orders_fact CONVERT TO CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci;
+    `;
+    const mysqlDdl = analyzeDdlGovernance(mysqlUnsafe, 'mysql');
+    assert.equal(mysqlDdl.ok, true);
+    assert.equal(mysqlDdl.alterStatementCount, 5);
+    assert.ok(mysqlDdl.totalScore < 100, 'ALTER-only DDL with lock risks must not score 100');
+    const mysqlCodes = mysqlDdl.findings.map((f) => f.ruleCode);
+    assert.ok(mysqlCodes.includes('MYSQL_ALTER_MODIFY_COLUMN'));
+    assert.ok(mysqlCodes.includes('MYSQL_ALTER_ADD_PRIMARY_KEY'));
+    assert.ok(mysqlCodes.includes('MYSQL_ALTER_ADD_FOREIGN_KEY'));
+    assert.ok(mysqlCodes.includes('MYSQL_ALTER_CONVERT_CHARSET'));
+    assert.equal(mysqlDdl.counts.p0, 2, 'ADD PRIMARY KEY + CONVERT TO CHARACTER SET are P0');
+    assert.equal(mysqlDdl.counts.p1, 3, 'MODIFY + CHANGE + ADD FOREIGN KEY are P1');
+    assert.match(mysqlDdl.findings.find((f) => f.ruleCode === 'MYSQL_ALTER_MODIFY_COLUMN').hint, /ALGORITHM=INSTANT|ALGORITHM=INPLACE, LOCK=NONE|gh-ost/);
+    assert.match(mysqlDdl.findings.find((f) => f.ruleCode === 'MYSQL_ALTER_CONVERT_CHARSET').hint, /gh-ost|pt-osc/);
+
+    // MySQL safe online MODIFY / CHANGE with explicit ALGORITHM=INPLACE, LOCK=NONE or ALGORITHM=INSTANT
+    const mysqlSafe = `
+        ALTER TABLE orders_fact MODIFY COLUMN status VARCHAR(64) NOT NULL, ALGORITHM=INPLACE, LOCK=NONE;
+        ALTER TABLE orders_fact ADD COLUMN extra_tag VARCHAR(32) DEFAULT NULL, ALGORITHM=INSTANT;
+    `;
+    const mysqlSafeRes = analyzeDdlGovernance(mysqlSafe, 'mysql');
+    assert.equal(mysqlSafeRes.ok, true);
+    assert.equal(mysqlSafeRes.findings.length, 0);
+    assert.equal(mysqlSafeRes.totalScore, 100);
+
+    // MySQL sql_readonly_review includes BOTH readonly write block and lock-risk findings
+    const mysqlSqlReview = reviewSqlReadonly('ALTER TABLE orders_fact CONVERT TO CHARACTER SET utf8mb4;', 'mysql');
+    assert.equal(mysqlSqlReview.ok, true);
+    assert.equal(mysqlSqlReview.readonlySafe, false);
+    assert.ok(mysqlSqlReview.findings.some((f) => f.ruleCode === 'R02_WRITE_OR_DDL'));
+    assert.ok(mysqlSqlReview.findings.some((f) => f.ruleCode === 'MYSQL_ALTER_CONVERT_CHARSET'));
+
+    // --- PostgreSQL positive lock risks ---
+    const pgUnsafe = `
+        ALTER TABLE orders_fact ALTER COLUMN pay_amount TYPE numeric(20,4);
+        ALTER TABLE orders_fact ALTER COLUMN status SET NOT NULL;
+        ALTER TABLE orders_fact ADD CONSTRAINT fk_customer FOREIGN KEY (customer_id) REFERENCES customer_profile(customer_id);
+        ALTER TABLE orders_fact ADD COLUMN trace_id uuid DEFAULT gen_random_uuid();
+        ALTER TABLE orders_fact ADD COLUMN rand_score double precision DEFAULT random();
+        ALTER TABLE orders_fact ADD COLUMN ts_now timestamptz DEFAULT clock_timestamp();
+        ALTER TABLE orders_fact ADD COLUMN legacy_uuid uuid DEFAULT uuid_generate_v4();
+    `;
+    const pgDdl = analyzeDdlGovernance(pgUnsafe, 'postgresql');
+    assert.equal(pgDdl.ok, true);
+    assert.equal(pgDdl.alterStatementCount, 7);
+    assert.ok(pgDdl.totalScore < 100);
+    const pgCodes = pgDdl.findings.map((f) => f.ruleCode);
+    assert.ok(pgCodes.includes('PG_ALTER_COLUMN_TYPE'));
+    assert.ok(pgCodes.includes('PG_ALTER_SET_NOT_NULL'));
+    assert.ok(pgCodes.includes('PG_ALTER_ADD_FK_WITHOUT_NOT_VALID'));
+    assert.equal(pgCodes.filter((c) => c === 'PG_ALTER_ADD_COL_VOLATILE_DEFAULT').length, 4);
+    assert.equal(pgDdl.counts.p0, 5, 'ALTER COLUMN TYPE + 4 volatile defaults are P0');
+    assert.equal(pgDdl.counts.p1, 2, 'SET NOT NULL + FK without NOT VALID are P1');
+    assert.match(pgDdl.findings.find((f) => f.ruleCode === 'PG_ALTER_COLUMN_TYPE').message, /ACCESS EXCLUSIVE/);
+
+    // PostgreSQL safe patterns: NOT VALID check before SET NOT NULL, FK with NOT VALID, non-volatile DEFAULT
+    const pgSafe = `
+        ALTER TABLE orders_fact ADD CONSTRAINT chk_status_nn CHECK (status IS NOT NULL) NOT VALID;
+        ALTER TABLE orders_fact VALIDATE CONSTRAINT chk_status_nn;
+        ALTER TABLE orders_fact ALTER COLUMN status SET NOT NULL;
+        ALTER TABLE orders_fact ADD CONSTRAINT fk_customer FOREIGN KEY (customer_id) REFERENCES customer_profile(customer_id) NOT VALID;
+        ALTER TABLE orders_fact ADD COLUMN retry_count integer DEFAULT 0;
+    `;
+    const pgSafeRes = analyzeDdlGovernance(pgSafe, 'postgresql');
+    assert.equal(pgSafeRes.ok, true);
+    assert.equal(pgSafeRes.findings.length, 0);
+
+    // PostgreSQL sql_readonly_review includes BOTH readonly write block and PG lock-risk finding
+    const pgSqlReview = reviewSqlReadonly('ALTER TABLE orders_fact ALTER COLUMN pay_amount TYPE numeric(20,4);', 'postgresql');
+    assert.equal(pgSqlReview.ok, true);
+    assert.equal(pgSqlReview.readonlySafe, false);
+    assert.ok(pgSqlReview.findings.some((f) => f.ruleCode === 'R02_WRITE_OR_DDL'));
+    assert.ok(pgSqlReview.findings.some((f) => f.ruleCode === 'PG_ALTER_COLUMN_TYPE'));
+
+    // Fault injection: ALTER TABLE inside SQL comments must NOT trigger
+    const commented = `
+        -- ALTER TABLE orders_fact CONVERT TO CHARACTER SET utf8mb4;
+        /* ALTER TABLE orders_fact ALTER COLUMN pay_amount TYPE text; */
+        SELECT id FROM orders_fact WHERE id = 1;
+    `;
+    const commentCheck = analyzeAlterLockRisks(commented, 'postgresql');
+    assert.equal(commentCheck.alterStatementCount, 0);
+    assert.equal(commentCheck.findings.length, 0);
+});
+
+test('Enterprise custom rule config (.surinchrc.json) supports disabledRules, severityOverrides, customSensitivePatterns, and rejects invalid configs', () => {
+    // Fault-injection: invalid configs MUST return INVALID_CONFIG
+    assert.equal(validateConfig(null).errorCode, 'INVALID_CONFIG');
+    assert.equal(validateConfig([]).errorCode, 'INVALID_CONFIG');
+    assert.equal(validateConfig({ disabledRules: 'R03_SELECT_STAR' }).errorCode, 'INVALID_CONFIG');
+    assert.equal(validateConfig({ severityOverrides: { R03_SELECT_STAR: 'CRITICAL' } }).errorCode, 'INVALID_CONFIG');
+    assert.equal(validateConfig({ customSensitivePatterns: [{ level: 'L9', pattern: 'foo', label: 'bad' }] }).errorCode, 'INVALID_CONFIG');
+    assert.equal(validateConfig({ customSensitivePatterns: [{ level: 'L3', pattern: '[unclosed', label: 'bad_re' }] }).errorCode, 'INVALID_CONFIG');
+    assert.equal(validateConfig({ customSensitivePatterns: [{ level: 'L3', pattern: 'foo', label: '' }] }).errorCode, 'INVALID_CONFIG');
+    assert.equal(loadConfigFile('/non/existent/path/.surinchrc.json').errorCode, 'INVALID_CONFIG');
+
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'surinch-cfg-test-'));
+    try {
+        // Malformed JSON file
+        const badJsonPath = path.join(tmpDir, 'bad.surinchrc.json');
+        fs.writeFileSync(badJsonPath, '{ invalid json', 'utf8');
+        assert.equal(loadConfigFile(badJsonPath).errorCode, 'INVALID_CONFIG');
+        assert.equal(reviewSqlReadonly('SELECT 1;', 'postgresql', { config: badJsonPath }).errorCode, 'INVALID_CONFIG');
+
+        // Valid enterprise config file
+        const validCfgPath = path.join(tmpDir, '.surinchrc.json');
+        const cfgObj = {
+            disabledRules: ['R03_SELECT_STAR', 'DDL_MISSING_TABLE_COMMENT', 'EMAIL'],
+            severityOverrides: {
+                R07_DEEP_PAGINATION: 'P0',
+                DDL_MISSING_AUDIT_TS: 'P2',
+            },
+            customSensitivePatterns: [
+                { level: 'L4', pattern: '(?:^|_)internal_tax_token(?:$|_)', label: 'ENTERPRISE_TAX_TOKEN' },
+                { level: 'L3', pattern: '(?:^|_)employee_badge_no(?:$|_)', label: 'EMPLOYEE_BADGE' },
+            ],
+        };
+        fs.writeFileSync(validCfgPath, JSON.stringify(cfgObj, null, 2), 'utf8');
+
+        // 1. sql_readonly_review with disabledRules + severityOverrides
+        const sqlRes = reviewSqlReadonly('SELECT * FROM orders LIMIT 10 OFFSET 5000;', 'postgresql', { config: validCfgPath });
+        assert.equal(sqlRes.ok, true);
+        assert.equal(sqlRes.findings.some((f) => f.ruleCode === 'R03_SELECT_STAR'), false, 'R03_SELECT_STAR should be disabled');
+        const deepPag = sqlRes.findings.find((f) => f.ruleCode === 'R07_DEEP_PAGINATION');
+        assert.equal(deepPag?.severity, 'P0', 'R07_DEEP_PAGINATION should be overridden to P0');
+        assert.equal(sqlRes.readonlySafe, false, 'P0 override blocks readonlySafe');
+
+        // 2. ddl_governance_check with disabledRules + severityOverrides
+        const ddlRes = analyzeDdlGovernance(`
+            CREATE TABLE orders_fact (
+                id BIGINT PRIMARY KEY COMMENT 'pk'
+            );
+        `, 'mysql', { config: validCfgPath });
+        assert.equal(ddlRes.ok, true);
+        assert.equal(ddlRes.findings.some((f) => f.ruleCode === 'DDL_MISSING_TABLE_COMMENT'), false);
+        assert.equal(ddlRes.findings.find((f) => f.ruleCode === 'DDL_MISSING_AUDIT_TS')?.severity, 'P2');
+
+        // 3. sensitive_masking_scan with customSensitivePatterns + disabledRules
+        const maskRes = scanSensitiveMasking(`
+            CREATE TABLE hr_records (
+                id BIGINT PRIMARY KEY,
+                email VARCHAR(128),
+                employee_badge_no VARCHAR(32),
+                internal_tax_token VARCHAR(128)
+            );
+        `, 'postgresql', { config: validCfgPath });
+        assert.equal(maskRes.ok, true);
+        assert.equal(maskRes.findings.some((f) => f.category === 'EMAIL'), false, 'EMAIL disabled by config');
+        assert.equal(maskRes.counts.l4, 1, 'internal_tax_token classified as L4');
+        assert.equal(maskRes.counts.l3, 1, 'employee_badge_no classified as L3');
+        assert.equal(maskRes.maskingViews.length, 1);
+        assert.match(maskRes.maskingViews[0].sql, /CAST\(NULL AS TEXT\) AS "internal_tax_token"/);
+
+        // 4. MCP tools/call with valid and invalid config
+        const mcpGood = handleJsonRpcRequest({
+            jsonrpc: '2.0',
+            id: 10,
+            method: 'tools/call',
+            params: {
+                name: 'sql_readonly_review',
+                arguments: {
+                    sql: 'SELECT * FROM orders;',
+                    dialect: 'postgresql',
+                    config: { disabledRules: ['R03_SELECT_STAR'] },
+                },
+            },
+        });
+        assert.equal(mcpGood.result.isError, false);
+        assert.equal(JSON.parse(mcpGood.result.content[0].text).result.findings.length, 0);
+
+        const mcpBad = handleJsonRpcRequest({
+            jsonrpc: '2.0',
+            id: 11,
+            method: 'tools/call',
+            params: {
+                name: 'sensitive_masking_scan',
+                arguments: {
+                    ddl: 'CREATE TABLE t (id INT);',
+                    dialect: 'mysql',
+                    config: { customSensitivePatterns: [{ level: 'L4', pattern: '([broken', label: 'bad' }] },
+                },
+            },
+        });
+        assert.equal(mcpBad.result.isError, true);
+        const mcpBadParsed = JSON.parse(mcpBad.result.content[0].text);
+        assert.equal(mcpBadParsed.result.errorCode, 'INVALID_CONFIG');
+        assert.equal(mcpBadParsed.receipt.verdict, 'INVALID_INPUT');
+
+        // 5. CLI --config with valid and invalid config
+        const cliPath = path.join(PKG_ROOT, 'bin', 'cli.mjs');
+        const cliCfgBlock = spawnSync(process.execPath, [cliPath, 'sql-review', '--dialect', 'postgresql', '--config', validCfgPath], {
+            input: 'SELECT id FROM orders LIMIT 10 OFFSET 5000;',
+            encoding: 'utf8',
+        });
+        assert.equal(cliCfgBlock.status, 1, 'Overridden P0 exits 1');
+        assert.equal(JSON.parse(cliCfgBlock.stdout).counts.p0, 1);
+
+        const cliCfgInvalid = spawnSync(process.execPath, [cliPath, 'sql-review', '--dialect', 'postgresql', '--config', badJsonPath], {
+            input: 'SELECT 1;',
+            encoding: 'utf8',
+        });
+        assert.equal(cliCfgInvalid.status, 2, 'Malformed config exits 2');
+        assert.equal(JSON.parse(cliCfgInvalid.stdout).errorCode, 'INVALID_CONFIG');
+    } finally {
+        fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+});
+
+test('Directory batch scanning (--dir) recursively scans .sql files, emits deterministic receipt, and fails non-zero on P0/empty dir', () => {
+    const cliPath = path.join(PKG_ROOT, 'bin', 'cli.mjs');
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'surinch-batch-test-'));
+    try {
+        // 1. Empty directory -> EMPTY_DIR, exit 2 (never fake green)
+        const emptyDir = path.join(tmpDir, 'empty');
+        fs.mkdirSync(emptyDir);
+        fs.writeFileSync(path.join(emptyDir, 'README.md'), '# not sql', 'utf8');
+        const emptyRun = spawnSync(process.execPath, [cliPath, 'ddl-check', '--dialect', 'mysql', '--dir', emptyDir], {
+            encoding: 'utf8',
+        });
+        assert.equal(emptyRun.status, 2);
+        const emptyParsed = JSON.parse(emptyRun.stdout);
+        assert.equal(emptyParsed.result.ok, false);
+        assert.equal(emptyParsed.result.errorCode, 'EMPTY_DIR');
+        assert.equal(emptyParsed.receipt.verdict, 'INVALID_INPUT');
+
+        // 2. Non-existent directory -> INVALID_DIR, exit 2
+        const missingRun = spawnSync(process.execPath, [cliPath, 'sql-review', '--dialect', 'postgresql', '--dir', path.join(tmpDir, 'does-not-exist')], {
+            encoding: 'utf8',
+        });
+        assert.equal(missingRun.status, 2);
+        assert.equal(JSON.parse(missingRun.stdout).result.errorCode, 'INVALID_DIR');
+
+        // 3. Clean nested directory -> exit 0, PASS, deterministic receipt
+        const cleanDir = path.join(tmpDir, 'clean');
+        fs.mkdirSync(path.join(cleanDir, 'nested', 'sub'), { recursive: true });
+        fs.writeFileSync(path.join(cleanDir, '01_orders.sql'), `
+            CREATE TABLE orders_fact (
+                id BIGINT PRIMARY KEY COMMENT 'pk',
+                pay_amount DECIMAL(18,2) NOT NULL COMMENT 'amount',
+                created_at DATETIME NOT NULL COMMENT 'ts'
+            ) COMMENT='orders';
+        `, 'utf8');
+        fs.writeFileSync(path.join(cleanDir, 'nested', 'sub', '02_items.sql'), `
+            CREATE TABLE order_items (
+                item_id BIGINT PRIMARY KEY COMMENT 'pk',
+                unit_price DECIMAL(18,2) NOT NULL COMMENT 'price',
+                created_at DATETIME NOT NULL COMMENT 'ts'
+            ) COMMENT='items';
+        `, 'utf8');
+        fs.writeFileSync(path.join(cleanDir, 'notes.txt'), 'ignored', 'utf8');
+
+        const cleanRun1 = spawnSync(process.execPath, [cliPath, 'ddl-check', '--dialect', 'mysql', '--dir', cleanDir], {
+            encoding: 'utf8',
+        });
+        const cleanRun2 = spawnSync(process.execPath, [cliPath, 'ddl-check', '--dialect', 'mysql', '--dir', cleanDir], {
+            encoding: 'utf8',
+        });
+        assert.equal(cleanRun1.status, 0);
+        const p1 = JSON.parse(cleanRun1.stdout);
+        const p2 = JSON.parse(cleanRun2.stdout);
+        assert.equal(p1.result.ok, true);
+        assert.equal(p1.result.fileCount, 2);
+        assert.deepEqual(p1.result.files.map((f) => f.file), ['01_orders.sql', 'nested/sub/02_items.sql']);
+        assert.equal(p1.result.summary.passedFiles, 2);
+        assert.equal(p1.receipt.schema_version, 'surinch.receipt.h1');
+        assert.equal(p1.receipt.verdict, 'PASS');
+        assert.equal(p1.receipt.input_sha256, p2.receipt.input_sha256);
+        assert.equal(p1.receipt.output_sha256, p2.receipt.output_sha256);
+
+        // 4. Directory with P0/BLOCK file across sql-review and mask-scan -> exit 1
+        const blockDir = path.join(tmpDir, 'block-sql');
+        fs.mkdirSync(blockDir);
+        fs.writeFileSync(path.join(blockDir, 'a_safe.sql'), 'SELECT id FROM orders WHERE id = 1;', 'utf8');
+        fs.writeFileSync(path.join(blockDir, 'b_alter.sql'), 'ALTER TABLE orders ALTER COLUMN pay_amount TYPE numeric(20,4);', 'utf8');
+
+        const blockSqlRun = spawnSync(process.execPath, [cliPath, 'sql-review', '--dialect', 'postgresql', '--dir', blockDir], {
+            encoding: 'utf8',
+        });
+        assert.equal(blockSqlRun.status, 1);
+        const blockSqlParsed = JSON.parse(blockSqlRun.stdout);
+        assert.equal(blockSqlParsed.result.summary.passedFiles, 1);
+        assert.equal(blockSqlParsed.result.summary.blockedFiles, 1);
+        assert.equal(blockSqlParsed.receipt.verdict, 'BLOCK');
+
+        const maskBatch = scanDirectoryBatch({
+            command: 'mask-scan',
+            dirPath: FIXTURES_DIR,
+            dialect: 'postgresql',
+        });
+        assert.equal(maskBatch.result.ok, true);
+        assert.equal(maskBatch.result.fileCount, 4);
+        assert.equal(maskBatch.receipt.verdict, 'BLOCK');
+
+        // 5. Directory with an invalid/comment-only .sql file -> exit 2 (never fake green)
+        const invalidFileDir = path.join(tmpDir, 'invalid-file');
+        fs.mkdirSync(invalidFileDir);
+        fs.writeFileSync(path.join(invalidFileDir, 'empty.sql'), '-- only comment', 'utf8');
+        const invalidFileRun = spawnSync(process.execPath, [cliPath, 'ddl-check', '--dialect', 'mysql', '--dir', invalidFileDir], {
+            encoding: 'utf8',
+        });
+        assert.equal(invalidFileRun.status, 2);
+        const invalidFileParsed = JSON.parse(invalidFileRun.stdout);
+        assert.equal(invalidFileParsed.result.ok, false);
+        assert.equal(invalidFileParsed.result.errorCode, 'BATCH_CONTAINS_INVALID_FILES');
+        assert.equal(invalidFileParsed.receipt.verdict, 'INVALID_INPUT');
+    } finally {
+        fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
 });
 
 test('Publishable package files contain no local host paths or embedded credentials', () => {

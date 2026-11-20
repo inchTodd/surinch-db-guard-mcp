@@ -14,9 +14,9 @@
 
 | MCP Tool | CLI Subcommand | What It Does | Hard Safety Guarantees |
 | --- | --- | --- | --- |
-| `ddl_governance_check` | `ddl-check` | Scores `CREATE TABLE` DDL (`mysql`, `postgresql`, `doris`) across 5 weighted dimensions (`25% naming`, `20% comments`, `20% primary key`, `20% audit monitoring`, `15% type precision`). Supports real `pg_dump` (PG 14–17) and `mysqldump` (MySQL 8.0/8.4). | Flags missing PKs and `FLOAT`/`DOUBLE` monetary columns as `P0`. Rejects empty input, comment-only SQL, and unsupported dialects with explicit error codes (**never fake green**). |
-| `sql_readonly_review` | `sql-review` | Static readonly safety gate & anti-pattern reviewer (`mysql`, `postgresql`). Lexically strips comments and string literals first so `REPLACE(...)` and `'DROP'` string literals never trigger false positives. | Blocks `EXPLAIN ANALYZE`, write/DDL statements, CTE writes, and `DELETE`/`UPDATE` without `WHERE` as `P0`. Flags `SELECT *`, `NOT IN (SELECT ...)`, leading wildcards, `WHERE` column functions, deep `OFFSET`, and PG integer division. |
-| `sensitive_masking_scan` | `mask-scan` | Metadata-only sensitive column classifier (`L4` credentials/secrets, `L3` national ID / bank / phone, `L2` email / name / address / IP) and deterministic `CREATE OR REPLACE VIEW` masking SQL generator (`mysql`, `postgresql`, `doris`). | **Never touches sample row data**—inspects schema metadata only. Redacts `L4` credentials to `NULL` by default and validates `viewPrefix` against SQL injection. |
+| `ddl_governance_check` | `ddl-check` | Scores `CREATE TABLE` & `ALTER TABLE` DDL (`mysql`, `postgresql`, `doris`) across 5 weighted dimensions (`25% naming`, `20% comments`, `20% primary key`, `20% audit monitoring`, `15% type precision`) plus `ALTER TABLE` lock-risk detection (MySQL `MODIFY/CHANGE`, `ADD PRIMARY KEY`, `ADD FOREIGN KEY`, `CONVERT TO CHARACTER SET`; PostgreSQL `ALTER COLUMN ... TYPE`, `SET NOT NULL`, FK without `NOT VALID`, volatile `DEFAULT`). Supports real `pg_dump` (PG 14–17) and `mysqldump` (MySQL 8.0/8.4). | Flags missing PKs, `FLOAT`/`DOUBLE` monetary columns, and table-rewriting `ALTER TABLE` locks as `P0`/`P1`. Rejects empty input, comment-only SQL, invalid `.surinchrc.json`, and unsupported dialects with explicit error codes (**never fake green**). |
+| `sql_readonly_review` | `sql-review` | Static readonly safety gate, `ALTER TABLE` lock-risk detector, and anti-pattern reviewer (`mysql`, `postgresql`). Lexically strips comments and string literals first so `REPLACE(...)` and `'DROP'` string literals never trigger false positives. | Blocks `EXPLAIN ANALYZE`, write/DDL statements, CTE writes, and `DELETE`/`UPDATE` without `WHERE` as `P0`, plus emits `ALTER TABLE` lock-risk guidance. Flags `SELECT *`, `NOT IN (SELECT ...)`, leading wildcards, `WHERE` column functions, deep `OFFSET`, and PG integer division. |
+| `sensitive_masking_scan` | `mask-scan` | Metadata-only sensitive column classifier (`L4` credentials/secrets, `L3` national ID / bank / phone, `L2` email / name / address / IP + custom enterprise regex patterns via `.surinchrc.json`) and deterministic `CREATE OR REPLACE VIEW` masking SQL generator (`mysql`, `postgresql`, `doris`). | **Never touches sample row data**—inspects schema metadata only. Redacts `L4` credentials to `NULL` by default and validates `viewPrefix` against SQL injection. |
 
 ### Verifiable Receipt (`surinch.receipt.h1`)
 
@@ -134,7 +134,29 @@ npx -y -p @surinch/db-guard-mcp surinch-db-guard mask-scan \
   --view-prefix v_masked_ \
   --file schema.sql \
   --receipt
+
+# 4. Recursive directory batch scan with enterprise .surinchrc.json rules
+npx -y -p @surinch/db-guard-mcp surinch-db-guard ddl-check \
+  --dialect postgresql \
+  --dir ./migrations \
+  --config ./.surinchrc.json
 ```
+
+### Enterprise Rule Config (`.surinchrc.json`)
+
+```json
+{
+  "disabledRules": ["R03_SELECT_STAR", "DDL_MISSING_TABLE_COMMENT"],
+  "severityOverrides": {
+    "R07_DEEP_PAGINATION": "P0"
+  },
+  "customSensitivePatterns": [
+    { "level": "L4", "pattern": "(?:^|_)internal_tax_token(?:$|_)", "label": "ENTERPRISE_TAX_TOKEN" }
+  ]
+}
+```
+
+Malformed JSON, invalid severities (`P0`/`P1`/`P2` only), or invalid regex patterns are rejected with `INVALID_CONFIG` (exit code `2`).
 
 ## Programmatic ESM Usage
 

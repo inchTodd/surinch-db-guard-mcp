@@ -10,40 +10,64 @@ import {
     ENGINE_VERSION,
 } from '../src/index.mjs';
 
+const CONFIG_SCHEMA = {
+    type: 'object',
+    description: 'Optional enterprise rule config (.surinchrc.json object): disabledRules, severityOverrides, customSensitivePatterns.',
+    properties: {
+        disabledRules: { type: 'array', items: { type: 'string' } },
+        severityOverrides: { type: 'object', additionalProperties: { type: 'string', enum: ['P0', 'P1', 'P2'] } },
+        customSensitivePatterns: {
+            type: 'array',
+            items: {
+                type: 'object',
+                properties: {
+                    level: { type: 'string', enum: ['L4', 'L3', 'L2'] },
+                    pattern: { type: 'string' },
+                    label: { type: 'string' },
+                },
+                required: ['level', 'pattern', 'label'],
+            },
+        },
+    },
+};
+
 const TOOLS = [
     {
         name: 'ddl_governance_check',
-        description: 'Score CREATE TABLE DDL (MySQL/PostgreSQL/Doris) across 5 weighted governance dimensions with SHA-256 verifiable receipt. Rejects empty/invalid input or unsupported dialect.',
+        description: 'Score CREATE TABLE / ALTER TABLE DDL (MySQL/PostgreSQL/Doris) across 5 weighted governance dimensions plus ALTER TABLE lock-risk detection, with SHA-256 verifiable receipt. Rejects empty/invalid input, invalid config, or unsupported dialect.',
         inputSchema: {
             type: 'object',
             properties: {
-                ddl: { type: 'string', description: 'Sanitized CREATE TABLE DDL text (no production credentials or row data).' },
+                ddl: { type: 'string', description: 'Sanitized CREATE TABLE / ALTER TABLE DDL text (no production credentials or row data).' },
                 dialect: { type: 'string', enum: ['mysql', 'postgresql', 'doris'], default: 'mysql' },
+                config: CONFIG_SCHEMA,
             },
             required: ['ddl'],
         },
     },
     {
         name: 'sql_readonly_review',
-        description: 'Static readonly safety gate & anti-pattern reviewer for MySQL/PostgreSQL SQL with SHA-256 verifiable receipt. Does not falsely flag REPLACE() or comments.',
+        description: 'Static readonly safety gate, ALTER TABLE lock-risk detector, and anti-pattern reviewer for MySQL/PostgreSQL SQL with SHA-256 verifiable receipt. Does not falsely flag REPLACE() or comments.',
         inputSchema: {
             type: 'object',
             properties: {
                 sql: { type: 'string', description: 'SQL statement(s) to review.' },
                 dialect: { type: 'string', enum: ['mysql', 'postgresql'], default: 'postgresql' },
+                config: CONFIG_SCHEMA,
             },
             required: ['sql'],
         },
     },
     {
         name: 'sensitive_masking_scan',
-        description: 'Metadata-only sensitive column classifier (L4/L3/L2) & deterministic masking VIEW SQL generator for MySQL/PostgreSQL/Doris DDL with SHA-256 verifiable receipt. Never reads row data.',
+        description: 'Metadata-only sensitive column classifier (L4/L3/L2 + custom enterprise patterns) & deterministic masking VIEW SQL generator for MySQL/PostgreSQL/Doris DDL with SHA-256 verifiable receipt. Never reads row data.',
         inputSchema: {
             type: 'object',
             properties: {
                 ddl: { type: 'string', description: 'CREATE TABLE DDL metadata text (schema-only, no sample row values).' },
                 dialect: { type: 'string', enum: ['mysql', 'postgresql', 'doris'], default: 'mysql' },
                 viewPrefix: { type: 'string', default: 'v_masked_', description: 'Prefix for generated masking VIEW names (alphanumeric + underscore).' },
+                config: CONFIG_SCHEMA,
             },
             required: ['ddl'],
         },
@@ -78,7 +102,9 @@ export function handleJsonRpcRequest(req) {
         const toolArgs = params?.arguments || {};
         if (name === 'ddl_governance_check') {
             const rawInput = String(toolArgs.ddl ?? '');
-            const result = analyzeDdlGovernance(rawInput, toolArgs.dialect ?? 'mysql');
+            const result = analyzeDdlGovernance(rawInput, toolArgs.dialect ?? 'mysql', {
+                config: toolArgs.config,
+            });
             const payload = { result, receipt: buildReceipt({ tool: name, rawInput, result }) };
             return {
                 jsonrpc: '2.0',
@@ -88,7 +114,9 @@ export function handleJsonRpcRequest(req) {
         }
         if (name === 'sql_readonly_review') {
             const rawInput = String(toolArgs.sql ?? '');
-            const result = reviewSqlReadonly(rawInput, toolArgs.dialect ?? 'postgresql');
+            const result = reviewSqlReadonly(rawInput, toolArgs.dialect ?? 'postgresql', {
+                config: toolArgs.config,
+            });
             const payload = { result, receipt: buildReceipt({ tool: name, rawInput, result }) };
             return {
                 jsonrpc: '2.0',
@@ -100,6 +128,7 @@ export function handleJsonRpcRequest(req) {
             const rawInput = String(toolArgs.ddl ?? '');
             const result = scanSensitiveMasking(rawInput, toolArgs.dialect ?? 'mysql', {
                 viewPrefix: toolArgs.viewPrefix,
+                config: toolArgs.config,
             });
             const payload = { result, receipt: buildReceipt({ tool: name, rawInput, result }) };
             return {
