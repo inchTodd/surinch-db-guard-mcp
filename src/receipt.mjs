@@ -1,6 +1,6 @@
 import crypto from 'node:crypto';
 
-export const ENGINE_VERSION = '0.1.0';
+export const ENGINE_VERSION = '0.2.0';
 export const RECEIPT_SCHEMA_VERSION = 'surinch.receipt.h1';
 
 function canonicalize(value) {

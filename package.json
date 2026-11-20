@@ -1,7 +1,7 @@
 {
   "name": "@surinch/db-guard-mcp",
   "mcpName": "io.github.inchTodd/surinch-db-guard-mcp",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Local-first, zero-dependency deterministic DDL governance scorer, SQL readonly safety reviewer, metadata-only sensitive masking scanner, and SHA-256 verifiable receipt CLI & MCP Server for MySQL, PostgreSQL, and Apache Doris.",
   "type": "module",
   "license": "Apache-2.0",
