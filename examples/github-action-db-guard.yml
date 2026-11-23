@@ -1,0 +1,35 @@
+# Copy to `.github/workflows/surinch-db-guard.yml` in your repository.
+# Runs deterministic DDL governance & ALTER TABLE lock-risk checks on every PR
+# touching `.sql` files, and uploads the verifiable `surinch.receipt.h1` audit receipt.
+name: Surinch DB Guard (SQL & DDL Gate)
+
+on:
+  pull_request:
+    paths:
+      - '**/*.sql'
+
+jobs:
+  ddl-governance-gate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Run Surinch DB Guard batch scan (--dir)
+        run: |
+          npx -y -p @surinch/db-guard-mcp@0.2.0 surinch-db-guard ddl-check \
+            --dialect postgresql \
+            --dir migrations \
+            --receipt > surinch-ddl-receipt.json
+
+      - name: Upload SHA-256 verifiable receipt
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: surinch-ddl-receipt
+          path: surinch-ddl-receipt.json

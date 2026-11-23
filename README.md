@@ -14,27 +14,32 @@
 
 | MCP Tool | CLI Subcommand | What It Does | Hard Safety Guarantees |
 | --- | --- | --- | --- |
-| `ddl_governance_check` | `ddl-check` | Scores `CREATE TABLE` & `ALTER TABLE` DDL (`mysql`, `postgresql`, `doris`) across 5 weighted dimensions (`25% naming`, `20% comments`, `20% primary key`, `20% audit monitoring`, `15% type precision`) plus `ALTER TABLE` lock-risk detection (MySQL `MODIFY/CHANGE`, `ADD PRIMARY KEY`, `ADD FOREIGN KEY`, `CONVERT TO CHARACTER SET`; PostgreSQL `ALTER COLUMN ... TYPE`, `SET NOT NULL`, FK without `NOT VALID`, volatile `DEFAULT`). Supports real `pg_dump` (PG 14–17) and `mysqldump` (MySQL 8.0/8.4). | Flags missing PKs, `FLOAT`/`DOUBLE` monetary columns, and table-rewriting `ALTER TABLE` locks as `P0`/`P1`. Rejects empty input, comment-only SQL, invalid `.surinchrc.json`, and unsupported dialects with explicit error codes (**never fake green**). |
-| `sql_readonly_review` | `sql-review` | Static readonly safety gate, `ALTER TABLE` lock-risk detector, and anti-pattern reviewer (`mysql`, `postgresql`). Lexically strips comments and string literals first so `REPLACE(...)` and `'DROP'` string literals never trigger false positives. | Blocks `EXPLAIN ANALYZE`, write/DDL statements, CTE writes, and `DELETE`/`UPDATE` without `WHERE` as `P0`, plus emits `ALTER TABLE` lock-risk guidance. Flags `SELECT *`, `NOT IN (SELECT ...)`, leading wildcards, `WHERE` column functions, deep `OFFSET`, and PG integer division. |
-| `sensitive_masking_scan` | `mask-scan` | Metadata-only sensitive column classifier (`L4` credentials/secrets, `L3` national ID / bank / phone, `L2` email / name / address / IP + custom enterprise regex patterns via `.surinchrc.json`) and deterministic `CREATE OR REPLACE VIEW` masking SQL generator (`mysql`, `postgresql`, `doris`). | **Never touches sample row data**—inspects schema metadata only. Redacts `L4` credentials to `NULL` by default and validates `viewPrefix` against SQL injection. |
+| `ddl_governance_check` | `ddl-check` | Scores `CREATE TABLE` & `ALTER TABLE` DDL (`mysql`, `postgresql`, `doris`) across 5 weighted dimensions (`25% naming`, `20% comments`, `20% primary key`, `20% audit monitoring`, `15% type precision`) plus `ALTER TABLE` lock-risk detection (MySQL `MODIFY/CHANGE`, `ADD/DROP PRIMARY KEY`, `ADD FOREIGN KEY`, `CONVERT TO CHARACTER SET`, `ENGINE=`, `ALGORITHM=COPY`; PostgreSQL `ALTER COLUMN ... TYPE`, `SET NOT NULL` sequential `NOT VALID` + `VALIDATE`, inline `REFERENCES`, `CHECK` without `NOT VALID`, volatile `DEFAULT`). Supports real `pg_dump` (PG 14–17) and `mysqldump` (MySQL 8.0/8.4). | Flags missing PKs, `FLOAT`/`DOUBLE` monetary columns, and table-rewriting `ALTER TABLE` locks as `P0`/`P1`. Rejects empty input, comment-only SQL, unrecognized statements (`UNPARSED_STATEMENT`), invalid `.surinchrc.json`, and unsupported dialects with explicit error codes. |
+| `sql_readonly_review` | `sql-review` | **Allowlist-first (default-deny)** static readonly safety gate, `ALTER TABLE` lock-risk detector, and anti-pattern reviewer (`mysql`, `postgresql`). Lexically handles comments, string literals, and PostgreSQL dollar-quoted blocks (`$$...$$`). | Permits only pure `SELECT`, readonly `WITH`, `SHOW`, `DESCRIBE`, and non-`ANALYZE` `EXPLAIN` (correctly allowing `EXPLAIN (ANALYZE false)`). Blocks `DO $$ ... $$`, write/DDL/admin statements (`COPY`, `LOAD DATA`, `FLUSH`, `SET`, `KILL`), data-modifying CTEs, `SELECT ... INTO`, row-locking `FOR UPDATE`, side-effect functions (`pg_sleep`, `pg_terminate_backend`, `SLEEP`), and `EXPLAIN ANALYZE` as `P0`. |
+| `sensitive_masking_scan` | `mask-scan` | Metadata-only sensitive column classifier (`L4` credentials/secrets/salts, `L3` national ID / bank / salary / phone, `L2` email / name / DOB / address / IP / social IDs + Chinese column names + custom regex via `.surinchrc.json`) and schema-aware `CREATE VIEW` masking SQL generator (`mysql`, `postgresql`, `doris`). | **Never touches sample row data**—inspects schema metadata only. Preserves source schemas (`"a"."v_masked_customer"`), emits safe `CREATE VIEW` by default (`--replace-view` opt-in), and validates `viewPrefix` against SQL injection. |
 
-### Verifiable Receipt (`surinch.receipt.h1`)
+### Verifiable Receipt (`surinch.receipt.h1`) & Trust Model
 
-Every MCP call and CLI `--receipt` invocation emits a deterministic receipt:
+Every MCP call and CLI `--receipt` invocation emits a deterministic receipt bound to raw input, dialect, engine version, and normalized rule config:
 
 ```json
 {
   "schema_version": "surinch.receipt.h1",
   "tool": "ddl_governance_check",
-  "engine_version": "0.1.0",
+  "dialect": "postgresql",
+  "engine_version": "0.3.0",
   "verdict": "PASS",
   "input_sha256": "<sha256 of raw input bytes>",
+  "config_sha256": "<sha256 of canonical normalized config>",
+  "context_sha256": "<sha256 of {tool, dialect, engine_version, input_sha256, config_sha256}>",
   "output_sha256": "<sha256 of canonical sorted-key JSON result>",
-  "generated_at": "2026-11-19T12:00:00.000Z"
+  "generated_at": "2026-11-23T12:00:00.000Z"
 }
 ```
 
-Given the same input and `engine_version`, `input_sha256` and `output_sha256` are byte-for-byte identical across machines and can be independently verified offline.
+**Trust Model**:
+- Comparing hashes (`surinch-verify receipt --receipt ... --input ... --result ...`) proves **mutual integrity/consistency** (`INTEGRITY_ONLY`), not provenance.
+- To independently prove an engine produced the verdict, re-run the engine with `@surinch/verifiable-core` in rerun mode (`surinch-verify receipt --receipt receipt.json --input schema.sql --rerun --dialect postgresql`) and/or verify an Ed25519 receipt signature (`--public-key`).
 
 ---
 
@@ -157,6 +162,19 @@ npx -y -p @surinch/db-guard-mcp surinch-db-guard ddl-check \
 ```
 
 Malformed JSON, invalid severities (`P0`/`P1`/`P2` only), or invalid regex patterns are rejected with `INVALID_CONFIG` (exit code `2`).
+
+### GitHub Actions PR Gate (Copy & Paste)
+
+See [examples/github-action-db-guard.yml](./examples/github-action-db-guard.yml) for a drop-in workflow that scans `migrations/**/*.sql` on every PR, blocks `P0` lock risks, and uploads the `surinch.receipt.h1` audit artifact:
+
+```yaml
+- name: Run Surinch DB Guard batch scan (--dir)
+  run: |
+    npx -y -p @surinch/db-guard-mcp@0.2.0 surinch-db-guard ddl-check \
+      --dialect postgresql \
+      --dir migrations \
+      --receipt > surinch-ddl-receipt.json
+```
 
 ## Programmatic ESM Usage
 

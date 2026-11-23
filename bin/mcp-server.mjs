@@ -12,7 +12,7 @@ import {
 
 const CONFIG_SCHEMA = {
     type: 'object',
-    description: 'Optional enterprise rule config (.surinchrc.json object): disabledRules, severityOverrides, customSensitivePatterns.',
+    description: 'Optional enterprise rule config (.surinchrc.json object): disabledRules, severityOverrides, customSensitivePatterns. File paths are forbidden over MCP.',
     properties: {
         disabledRules: { type: 'array', items: { type: 'string' } },
         severityOverrides: { type: 'object', additionalProperties: { type: 'string', enum: ['P0', 'P1', 'P2'] } },
@@ -34,7 +34,7 @@ const CONFIG_SCHEMA = {
 const TOOLS = [
     {
         name: 'ddl_governance_check',
-        description: 'Score CREATE TABLE / ALTER TABLE DDL (MySQL/PostgreSQL/Doris) across 5 weighted governance dimensions plus ALTER TABLE lock-risk detection, with SHA-256 verifiable receipt. Rejects empty/invalid input, invalid config, or unsupported dialect.',
+        description: 'Score CREATE TABLE / ALTER TABLE DDL (MySQL/PostgreSQL/Doris) across 5 weighted governance dimensions plus ALTER TABLE lock-risk detection, with SHA-256 verifiable receipt. Rejects empty/invalid input, unparsed statements, invalid config, or unsupported dialect.',
         inputSchema: {
             type: 'object',
             properties: {
@@ -47,7 +47,7 @@ const TOOLS = [
     },
     {
         name: 'sql_readonly_review',
-        description: 'Static readonly safety gate, ALTER TABLE lock-risk detector, and anti-pattern reviewer for MySQL/PostgreSQL SQL with SHA-256 verifiable receipt. Does not falsely flag REPLACE() or comments.',
+        description: 'Allowlist-first static readonly safety gate, ALTER TABLE lock-risk detector, and anti-pattern reviewer for MySQL/PostgreSQL SQL with SHA-256 verifiable receipt. Blocks non-readonly statements, DO blocks, data-modifying CTEs, SELECT INTO, side-effect functions, and EXPLAIN ANALYZE.',
         inputSchema: {
             type: 'object',
             properties: {
@@ -60,13 +60,14 @@ const TOOLS = [
     },
     {
         name: 'sensitive_masking_scan',
-        description: 'Metadata-only sensitive column classifier (L4/L3/L2 + custom enterprise patterns) & deterministic masking VIEW SQL generator for MySQL/PostgreSQL/Doris DDL with SHA-256 verifiable receipt. Never reads row data.',
+        description: 'Metadata-only sensitive column classifier (L4/L3/L2 + custom enterprise patterns) & schema-aware masking VIEW SQL generator for MySQL/PostgreSQL/Doris DDL with SHA-256 verifiable receipt. Never reads row data.',
         inputSchema: {
             type: 'object',
             properties: {
                 ddl: { type: 'string', description: 'CREATE TABLE DDL metadata text (schema-only, no sample row values).' },
                 dialect: { type: 'string', enum: ['mysql', 'postgresql', 'doris'], default: 'mysql' },
                 viewPrefix: { type: 'string', default: 'v_masked_', description: 'Prefix for generated masking VIEW names (alphanumeric + underscore).' },
+                replaceView: { type: 'boolean', default: false, description: 'Emit CREATE OR REPLACE VIEW instead of safe default CREATE VIEW.' },
                 config: CONFIG_SCHEMA,
             },
             required: ['ddl'],
@@ -78,8 +79,31 @@ function send(msg) {
     process.stdout.write(`${JSON.stringify(msg)}\n`);
 }
 
+function validateMcpConfigArg(configArg) {
+    if (configArg === undefined || configArg === null) return { ok: true, config: undefined };
+    // Security (C4): Never allow MCP callers to pass local filesystem paths to config
+    if (typeof configArg !== 'object' || Array.isArray(configArg)) {
+        return {
+            ok: false,
+            errorCode: 'INVALID_CONFIG',
+            message: 'MCP "config" argument must be an inline JSON object; file path strings are not allowed over MCP.',
+        };
+    }
+    return { ok: true, config: configArg };
+}
+
 export function handleJsonRpcRequest(req) {
     const { id, method, params } = req || {};
+
+    // JSON-RPC 2.0 & MCP notifications MUST NOT receive a response
+    if (id === undefined || (typeof method === 'string' && method.startsWith('notifications/'))) {
+        return null;
+    }
+
+    if (method === 'ping') {
+        return { jsonrpc: '2.0', id, result: {} };
+    }
+
     if (method === 'initialize') {
         return {
             jsonrpc: '2.0',
@@ -91,21 +115,37 @@ export function handleJsonRpcRequest(req) {
             },
         };
     }
-    if (method === 'notifications/initialized') {
-        return null;
-    }
+
     if (method === 'tools/list') {
         return { jsonrpc: '2.0', id, result: { tools: TOOLS } };
     }
+
     if (method === 'tools/call') {
         const name = params?.name;
         const toolArgs = params?.arguments || {};
+
+        const mcpCfg = validateMcpConfigArg(toolArgs.config);
+        if (!mcpCfg.ok) {
+            const rawInput = String(toolArgs.ddl ?? toolArgs.sql ?? '');
+            const dialect = toolArgs.dialect ?? (name === 'sql_readonly_review' ? 'postgresql' : 'mysql');
+            const payload = {
+                result: mcpCfg,
+                receipt: buildReceipt({ tool: name || 'unknown', rawInput, result: mcpCfg, dialect }),
+            };
+            return {
+                jsonrpc: '2.0',
+                id,
+                result: { content: [{ type: 'text', text: JSON.stringify(payload, null, 2) }], isError: true },
+            };
+        }
+
         if (name === 'ddl_governance_check') {
             const rawInput = String(toolArgs.ddl ?? '');
-            const result = analyzeDdlGovernance(rawInput, toolArgs.dialect ?? 'mysql', {
-                config: toolArgs.config,
+            const dialect = toolArgs.dialect ?? 'mysql';
+            const result = analyzeDdlGovernance(rawInput, dialect, {
+                config: mcpCfg.config,
             });
-            const payload = { result, receipt: buildReceipt({ tool: name, rawInput, result }) };
+            const payload = { result, receipt: buildReceipt({ tool: name, rawInput, result, dialect, config: mcpCfg.config }) };
             return {
                 jsonrpc: '2.0',
                 id,
@@ -114,10 +154,11 @@ export function handleJsonRpcRequest(req) {
         }
         if (name === 'sql_readonly_review') {
             const rawInput = String(toolArgs.sql ?? '');
-            const result = reviewSqlReadonly(rawInput, toolArgs.dialect ?? 'postgresql', {
-                config: toolArgs.config,
+            const dialect = toolArgs.dialect ?? 'postgresql';
+            const result = reviewSqlReadonly(rawInput, dialect, {
+                config: mcpCfg.config,
             });
-            const payload = { result, receipt: buildReceipt({ tool: name, rawInput, result }) };
+            const payload = { result, receipt: buildReceipt({ tool: name, rawInput, result, dialect, config: mcpCfg.config }) };
             return {
                 jsonrpc: '2.0',
                 id,
@@ -126,11 +167,13 @@ export function handleJsonRpcRequest(req) {
         }
         if (name === 'sensitive_masking_scan') {
             const rawInput = String(toolArgs.ddl ?? '');
-            const result = scanSensitiveMasking(rawInput, toolArgs.dialect ?? 'mysql', {
+            const dialect = toolArgs.dialect ?? 'mysql';
+            const result = scanSensitiveMasking(rawInput, dialect, {
                 viewPrefix: toolArgs.viewPrefix,
-                config: toolArgs.config,
+                replaceView: toolArgs.replaceView,
+                config: mcpCfg.config,
             });
-            const payload = { result, receipt: buildReceipt({ tool: name, rawInput, result }) };
+            const payload = { result, receipt: buildReceipt({ tool: name, rawInput, result, dialect, config: mcpCfg.config }) };
             return {
                 jsonrpc: '2.0',
                 id,

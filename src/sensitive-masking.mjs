@@ -9,7 +9,7 @@ const SENSITIVE_RULES = [
         level: 'L4',
         severity: 'P0',
         strategy: 'REDACT_NULL',
-        nameRe: /(?:^|_)(password|passwd|pwd|password_hash|secret|secret_key|api_key|api_secret|api_secret_key|access_token|refresh_token|auth_token|session_token|private_key|client_secret)(?:$|_)/i,
+        nameRe: /(?:(?:^|_)(?:password|passwd|pwd|password_hash|pwd_hash|salt|password_salt|pwd_salt|secret|secret_key|secret_token|api_key|api_secret|api_secret_key|access_token|refresh_token|auth_token|session_token|private_key|signing_key|master_key|encryption_key|client_secret|credential|jwt)(?:$|_)|(?:密码|口令|密钥|盐值))/i,
         rationale: 'Credential or secret column must never be exposed in analytics or BI views.',
     },
     {
@@ -17,7 +17,7 @@ const SENSITIVE_RULES = [
         level: 'L3',
         severity: 'P1',
         strategy: 'MASK_KEEP_3_4',
-        nameRe: /(?:^|_)(id_card|id_card_no|id_no|identity_no|identity_card|national_id|ssn|social_security|passport|passport_no|driver_license)(?:$|_)/i,
+        nameRe: /(?:(?:^|_)(?:id_card|id_card_no|id_no|id_number|identity_no|identity_number|identity_card|national_id|citizen_id|resident_id|ssn|social_security|passport|passport_no|driver_license|tax_id|tin|ein|cert_no|certificate_no)(?:$|_)|(?:身份证|证件号|护照|社保号|税号))/i,
         rationale: 'Government-issued identifier requires strong masking (keep prefix/suffix only).',
     },
     {
@@ -25,15 +25,15 @@ const SENSITIVE_RULES = [
         level: 'L3',
         severity: 'P1',
         strategy: 'MASK_LAST_4',
-        nameRe: /(?:^|_)(bank_card|bank_card_no|bank_card_number|bank_account|bank_acct|credit_card|debit_card|card_no|card_number|iban|cvv|cvc)(?:$|_)/i,
-        rationale: 'Financial account or payment card number requires masking (keep last 4 digits).',
+        nameRe: /(?:(?:^|_)(?:bank_card|bank_card_no|bank_card_number|bank_account|bank_acct|bank_no|account_no|acct_no|account_number|credit_card|debit_card|card_no|card_number|iban|cvv|cvc|routing_number|swift_code|salary|base_salary|monthly_salary|wage|income|alipay_account|wechat_pay)(?:$|_)|(?:银行卡|卡号|账号|薪资|工资|薪酬|收入))/i,
+        rationale: 'Financial account, payment card, or compensation column requires masking.',
     },
     {
         category: 'MOBILE_PHONE',
         level: 'L3',
         severity: 'P1',
         strategy: 'MASK_KEEP_3_4',
-        nameRe: /(?:^|_)(mobile|mobile_phone|mobile_no|phone|phone_no|phone_number|tel|telephone|cellphone|contact_phone)(?:$|_)/i,
+        nameRe: /(?:(?:^|_)(?:mobile|mobile_phone|mobile_no|mobile_num|phone|phone_no|phone_num|phone_number|tel|tel_no|telephone|cellphone|contact_phone|whatsapp)(?:$|_)|(?:手机|电话|联系电话))/i,
         rationale: 'Personal telephone/mobile number requires masking (keep first 3 and last 4 digits).',
     },
     {
@@ -41,7 +41,7 @@ const SENSITIVE_RULES = [
         level: 'L2',
         severity: 'P2',
         strategy: 'MASK_EMAIL',
-        nameRe: /(?:^|_)(email|email_address|mail|contact_email)(?:$|_)/i,
+        nameRe: /(?:(?:^|_)(?:email|email_address|email_addr|user_email|mail|contact_email)(?:$|_)|(?:邮箱|电子邮箱))/i,
         rationale: 'Email address should mask local-part while preserving domain for analytics.',
     },
     {
@@ -49,23 +49,23 @@ const SENSITIVE_RULES = [
         level: 'L2',
         severity: 'P2',
         strategy: 'MASK_FIRST_CHAR',
-        nameRe: /(?:^|_)(full_name|real_name|true_name|legal_name|customer_name|user_name|contact_name|cardholder_name|recipient_name)(?:$|_)/i,
-        rationale: 'Personal real name should retain only initial character.',
+        nameRe: /(?:(?:^|_)(?:full_name|real_name|true_name|legal_name|customer_name|user_name|contact_name|cardholder_name|recipient_name|first_name|last_name|given_name|family_name|surname|middle_name|birth_date|birthdate|birthday|dob|date_of_birth)(?:$|_)|(?:姓名|真实姓名|生日|出生日期))/i,
+        rationale: 'Personal name or date of birth should be generalized or masked.',
     },
     {
         category: 'IP_DEVICE',
         level: 'L2',
         severity: 'P2',
         strategy: 'MASK_FIRST_CHAR',
-        nameRe: /(?:^|_)(ip_address|client_ip|login_ip|remote_ip|mac_address|imei|idfa|oaid|device_id)(?:$|_)/i,
-        rationale: 'Network/device identifier should be masked or pseudonymized.',
+        nameRe: /(?:(?:^|_)(?:ip_address|client_ip|login_ip|remote_ip|mac_address|imei|idfa|oaid|device_id|openid|unionid|wx_openid|wechat|wechat_id|qq|qq_no)(?:$|_)|(?:微信号|微信))/i,
+        rationale: 'Network, device, or social platform identifier should be masked or pseudonymized.',
     },
     {
         category: 'ADDRESS',
         level: 'L2',
         severity: 'P2',
         strategy: 'MASK_KEEP_6',
-        nameRe: /(?:^|_)(home_address|street_address|detail_address|shipping_address|mailing_address|residential_address|address)(?:$|_)/i,
+        nameRe: /(?:(?:^|_)(?:home_address|home_addr|street_address|detail_address|shipping_address|mailing_address|residential_address|billing_address|delivery_address|address|addr)(?:$|_)|(?:地址|住址|收货地址))/i,
         rationale: 'Physical address should be generalized to coarse prefix.',
     },
 ];
@@ -73,6 +73,13 @@ const SENSITIVE_RULES = [
 function quoteIdent(name, dialect) {
     if (dialect === 'postgresql') return `"${String(name).replace(/"/g, '""')}"`;
     return `\`${String(name).replace(/`/g, '``')}\``;
+}
+
+function quoteQualifiedIdent(schema, name, dialect) {
+    if (schema) {
+        return `${quoteIdent(schema, dialect)}.${quoteIdent(name, dialect)}`;
+    }
+    return quoteIdent(name, dialect);
 }
 
 function buildMaskExpr(colName, strategy, dialect) {
@@ -138,6 +145,9 @@ export function scanSensitiveMasking(rawSql, dialect = 'mysql', options = {}) {
         };
     }
 
+    // Default to safe `CREATE VIEW` (do not silently overwrite existing views unless caller opts in)
+    const replaceView = Boolean(options.replaceView);
+
     const trimmed = String(rawSql || '').trim();
     if (!trimmed) {
         return { ok: false, errorCode: 'EMPTY_INPUT', message: 'Input DDL is empty.' };
@@ -162,12 +172,13 @@ export function scanSensitiveMasking(rawSql, dialect = 'mysql', options = {}) {
         totalCols += pt.columns.length;
         const matchedCols = new Map();
         const tableSensitive = [];
+        const tableLabel = pt.schema ? `${pt.schema}.${pt.name}` : pt.name;
 
         for (const col of pt.columns) {
             const rule = allRules.find((r) => {
                 if (!r.nameRe.test(col.name)) return false;
                 const candidate = {
-                    id: `${pt.name}.${col.name}-${r.category.toLowerCase().replace(/[^a-z0-9_]+/g, '_')}`,
+                    id: `${tableLabel}.${col.name}-${r.category.toLowerCase().replace(/[^a-z0-9_]+/g, '_')}`,
                     ruleCode: r.ruleCode || r.category,
                     category: r.category,
                 };
@@ -175,18 +186,20 @@ export function scanSensitiveMasking(rawSql, dialect = 'mysql', options = {}) {
             });
             if (rule) {
                 const ruleCode = rule.ruleCode || rule.category;
-                const id = `${pt.name}.${col.name}-${rule.category.toLowerCase().replace(/[^a-z0-9_]+/g, '_')}`;
+                const id = `${tableLabel}.${col.name}-${rule.category.toLowerCase().replace(/[^a-z0-9_]+/g, '_')}`;
                 const baseItem = {
                     id,
                     ruleCode,
+                    schema: pt.schema || null,
                     table: pt.name,
+                    qualifiedTable: tableLabel,
                     column: col.name,
                     rawType: col.rawType,
                     category: rule.category,
                     level: rule.level,
                     severity: rule.severity,
                     strategy: rule.strategy,
-                    message: `Sensitive ${rule.level} (${rule.category}) column "${pt.name}.${col.name}": ${rule.rationale}`,
+                    message: `Sensitive ${rule.level} (${rule.category}) column "${tableLabel}.${col.name}": ${rule.rationale}`,
                 };
                 if (rule.custom) baseItem.custom = true;
                 const finalSeverity = resolveRuleSeverity(baseItem, config);
@@ -204,20 +217,27 @@ export function scanSensitiveMasking(rawSql, dialect = 'mysql', options = {}) {
         }
 
         if (matchedCols.size > 0) {
-            const viewName = `${viewPrefix}${pt.name}`;
+            const baseViewName = `${viewPrefix}${pt.name}`;
+            const viewName = pt.schema ? `${pt.schema}.${baseViewName}` : baseViewName;
+            const quotedView = quoteQualifiedIdent(pt.schema, baseViewName, normalizedDialect);
+            const quotedSource = quoteQualifiedIdent(pt.schema, pt.name, normalizedDialect);
+            const createKeyword = replaceView ? 'CREATE OR REPLACE VIEW' : 'CREATE VIEW';
+
             const selectExprs = pt.columns.map((col) => {
                 const rule = matchedCols.get(col.name);
                 return rule ? buildMaskExpr(col.name, rule.strategy, normalizedDialect) : quoteIdent(col.name, normalizedDialect);
             });
             const viewSql = [
-                `CREATE OR REPLACE VIEW ${quoteIdent(viewName, normalizedDialect)} AS`,
+                `${createKeyword} ${quotedView} AS`,
                 'SELECT',
                 selectExprs.map((e) => `    ${e}`).join(',\n'),
-                `FROM ${quoteIdent(pt.name, normalizedDialect)};`,
+                `FROM ${quotedSource};`,
             ].join('\n');
 
             maskingViews.push({
+                schema: pt.schema || null,
                 table: pt.name,
+                qualifiedTable: tableLabel,
                 viewName,
                 maskedColumnCount: matchedCols.size,
                 sql: viewSql,
@@ -225,7 +245,9 @@ export function scanSensitiveMasking(rawSql, dialect = 'mysql', options = {}) {
         }
 
         tables.push({
+            schema: pt.schema || null,
             name: pt.name,
+            qualifiedName: tableLabel,
             columnCount: pt.columns.length,
             sensitiveColumnCount: matchedCols.size,
             sensitiveColumns: tableSensitive,

@@ -140,8 +140,9 @@ test('sensitive_masking_scan classifies L4/L3/L2 metadata and generates dialect-
         assert.equal(res.counts.l3, 3, `${file}: mobile_phone + id_card_no + bank_card_number`);
         assert.equal(res.counts.l2, 3, `${file}: full_name + email_address + home_address`);
         assert.equal(res.maskingViews.length, 1);
-        assert.equal(res.maskingViews[0].viewName, 'v_masked_customer_profile');
-        assert.match(res.maskingViews[0].sql, /CREATE OR REPLACE VIEW "v_masked_customer_profile" AS/);
+        assert.equal(res.maskingViews[0].viewName, 'public.v_masked_customer_profile');
+        assert.match(res.maskingViews[0].sql, /CREATE VIEW "public"\."v_masked_customer_profile" AS/);
+        assert.match(res.maskingViews[0].sql, /FROM "public"\."customer_profile";/);
         assert.match(res.maskingViews[0].sql, /CAST\(NULL AS TEXT\) AS "password_hash"/);
         assert.match(res.maskingViews[0].sql, /SPLIT_PART/);
     }
@@ -156,7 +157,7 @@ test('sensitive_masking_scan classifies L4/L3/L2 metadata and generates dialect-
         assert.equal(res.findings.find((f) => f.column === 'ip_address')?.category, 'IP_DEVICE');
         assert.equal(res.maskingViews.length, 1);
         assert.equal(res.maskingViews[0].viewName, 'v_masked_customer_profile');
-        assert.match(res.maskingViews[0].sql, /CREATE OR REPLACE VIEW `v_masked_customer_profile` AS/);
+        assert.match(res.maskingViews[0].sql, /CREATE VIEW `v_masked_customer_profile` AS/);
         assert.match(res.maskingViews[0].sql, /CAST\(NULL AS CHAR\(1\)\) AS `password_hash`/);
         assert.match(res.maskingViews[0].sql, /SUBSTRING_INDEX/);
     }
@@ -596,4 +597,200 @@ test('Publishable package files contain no local host paths or embedded credenti
             assert.equal(re.test(content), false, `Forbidden pattern ${re} found in ${path.relative(PKG_ROOT, file)}`);
         }
     }
+});
+
+test('Audit A1 & S4-1: allowlist-first SQL readonly review blocks all write/side-effect probes and allows EXPLAIN (ANALYZE false)', () => {
+    const blockedProbes = [
+        ['postgresql', 'DO $$ BEGIN DELETE FROM orders; END $$;'],
+        ['postgresql', 'WITH d AS (DELETE FROM orders RETURNING *) SELECT * FROM d;'],
+        ['postgresql', 'WITH u AS (UPDATE orders SET status = 1 RETURNING *) SELECT id FROM u;'],
+        ['postgresql', 'SELECT * INTO orders_backup FROM orders;'],
+        ['postgresql', "COPY orders TO '/tmp/orders.csv';"],
+        ['postgresql', 'SELECT pg_sleep(600);'],
+        ['postgresql', 'SELECT pg_terminate_backend(12345);'],
+        ['postgresql', 'SELECT id FROM orders FOR UPDATE;'],
+        ['postgresql', 'SET statement_timeout = 0;'],
+        ['postgresql', 'NOTIFY ch, \'payload\';'],
+        ['postgresql', 'SELECT $$unclosed'],
+        ['mysql', "LOAD DATA INFILE '/etc/passwd' INTO TABLE t;"],
+        ['mysql', 'DO SLEEP(1000);'],
+        ['mysql', 'FLUSH TABLES WITH READ LOCK;'],
+        ['mysql', 'SET GLOBAL read_only = 0;'],
+        ['mysql', 'STOP REPLICA;'],
+        ['mysql', 'KILL 999;'],
+        ['mysql', "SELECT id INTO OUTFILE '/tmp/out.txt' FROM orders;"],
+        ['mysql', 'SELECT SLEEP(10);'],
+    ];
+
+    for (const [dialect, sql] of blockedProbes) {
+        const r = reviewSqlReadonly(sql, dialect);
+        assert.equal(r.ok, true, `Should analyze [${dialect}] ${sql}`);
+        assert.equal(r.readonlySafe, false, `Must block [${dialect}] ${sql}`);
+        assert.equal(r.verdict, 'WRITE_OR_DDL_BLOCKED', `Must return WRITE_OR_DDL_BLOCKED for [${dialect}] ${sql}`);
+        assert.ok(r.counts.p0 >= 1, `Must have P0 finding for [${dialect}] ${sql}`);
+    }
+
+    // S4-1: EXPLAIN (ANALYZE false / off / 0) must NOT trigger R01_EXPLAIN_ANALYZE
+    for (const safeExplain of [
+        'EXPLAIN (ANALYZE false, FORMAT json) SELECT id FROM orders WHERE id = 1;',
+        'EXPLAIN (ANALYZE off) SELECT id FROM orders WHERE id = 1;',
+        'EXPLAIN (ANALYZE 0) SELECT id FROM orders WHERE id = 1;',
+        'EXPLAIN SELECT id FROM orders WHERE id = 1;',
+        'SHOW TABLES;',
+        'DESCRIBE orders;',
+    ]) {
+        const r = reviewSqlReadonly(safeExplain, 'postgresql');
+        assert.equal(r.ok, true);
+        assert.equal(r.readonlySafe, true, `Should allow safe readonly: ${safeExplain}`);
+        assert.equal(r.findings.some((f) => f.ruleCode === 'R01_EXPLAIN_ANALYZE'), false);
+    }
+});
+
+test('Audit B6 & S4-3/4: ALTER lock rules, NOT VALID ordering, PG varchar widening, dollar-quoted COMMENT, and VARCHAR without length', () => {
+    // MySQL misses fixed
+    for (const [sql, expectedRule] of [
+        ['ALTER TABLE orders DROP PRIMARY KEY;', 'MYSQL_ALTER_DROP_PRIMARY_KEY'],
+        ['ALTER TABLE orders ENGINE=InnoDB;', 'MYSQL_ALTER_REBUILD_ENGINE'],
+        ['ALTER TABLE orders ADD COLUMN x INT, ALGORITHM=COPY;', 'MYSQL_ALTER_ALGORITHM_COPY'],
+        ['ALTER TABLE orders ADD COLUMN id INT PRIMARY KEY;', 'MYSQL_ALTER_ADD_PRIMARY_KEY'],
+    ]) {
+        const r = analyzeDdlGovernance(sql, 'mysql');
+        assert.equal(r.ok, true);
+        assert.ok(r.findings.some((f) => f.ruleCode === expectedRule), `Expected ${expectedRule} for ${sql}`);
+        assert.ok(r.totalScore < 100, `Expected score < 100 for ${sql}`);
+    }
+
+    // PG misses fixed: inline REFERENCES + ADD CONSTRAINT CHECK
+    const pgInlineRef = analyzeDdlGovernance('ALTER TABLE orders ADD COLUMN user_id int REFERENCES users(id);', 'postgresql');
+    assert.ok(pgInlineRef.findings.some((f) => f.ruleCode === 'PG_ALTER_ADD_FK_WITHOUT_NOT_VALID'));
+    const pgCheck = analyzeDdlGovernance('ALTER TABLE orders ADD CONSTRAINT chk CHECK (amount >= 0);', 'postgresql');
+    assert.ok(pgCheck.findings.some((f) => f.ruleCode === 'PG_ALTER_ADD_CHECK_WITHOUT_NOT_VALID'));
+
+    // PG NOT VALID without VALIDATE CONSTRAINT must STILL flag SET NOT NULL
+    const missingValidate = analyzeDdlGovernance(`
+        ALTER TABLE orders ADD CONSTRAINT chk_s CHECK (status IS NOT NULL) NOT VALID;
+        ALTER TABLE orders ALTER COLUMN status SET NOT NULL;
+    `, 'postgresql');
+    assert.ok(missingValidate.findings.some((f) => f.ruleCode === 'PG_ALTER_SET_NOT_NULL'), 'Missing VALIDATE must not exempt SET NOT NULL');
+
+    // PG NOT VALID placed AFTER SET NOT NULL must STILL flag SET NOT NULL
+    const reversedOrder = analyzeDdlGovernance(`
+        ALTER TABLE orders ALTER COLUMN status SET NOT NULL;
+        ALTER TABLE orders ADD CONSTRAINT chk_s CHECK (status IS NOT NULL) NOT VALID;
+        ALTER TABLE orders VALIDATE CONSTRAINT chk_s;
+    `, 'postgresql');
+    assert.ok(reversedOrder.findings.some((f) => f.ruleCode === 'PG_ALTER_SET_NOT_NULL'), 'Reversed order must not exempt SET NOT NULL');
+
+    // PG varchar(50) -> varchar(500) widening does NOT rewrite table (no P0)
+    const pgWiden = analyzeDdlGovernance(`
+        CREATE TABLE orders (
+            id BIGINT PRIMARY KEY,
+            name varchar(50),
+            created_at timestamptz
+        );
+        COMMENT ON TABLE orders IS $$orders table$$;
+        COMMENT ON COLUMN orders.id IS $$pk$$;
+        COMMENT ON COLUMN orders.name IS $$customer name$$;
+        COMMENT ON COLUMN orders.created_at IS $$ts$$;
+        ALTER TABLE orders ALTER COLUMN name TYPE varchar(500);
+    `, 'postgresql');
+    assert.equal(pgWiden.ok, true);
+    assert.equal(pgWiden.findings.some((f) => f.ruleCode === 'PG_ALTER_COLUMN_TYPE'), false, 'Known varchar(50)->varchar(500) widening must not flag rewrite');
+    // S4-3: dollar-quoted comments recognized
+    assert.equal(pgWiden.tables[0].hasTableComment, true);
+    assert.equal(pgWiden.tables[0].commentedColumns, 3);
+    assert.equal(pgWiden.totalScore, 100);
+
+    // Standalone PG ALTER COLUMN name TYPE varchar(500) (unknown original type) is P1, not P0
+    const pgStandaloneVarchar = analyzeDdlGovernance('ALTER TABLE orders ALTER COLUMN name TYPE varchar(500);', 'postgresql');
+    const typeFinding = pgStandaloneVarchar.findings.find((f) => f.ruleCode === 'PG_ALTER_COLUMN_TYPE');
+    assert.equal(typeFinding?.severity, 'P1');
+
+    // S4-4: MySQL VARCHAR without length followed by NOT NULL COMMENT
+    const mysqlNoLen = analyzeDdlGovernance(`
+        CREATE TABLE users (
+            id BIGINT PRIMARY KEY COMMENT 'pk',
+            nick VARCHAR NOT NULL COMMENT 'nick',
+            created_at DATETIME COMMENT 'ts'
+        ) COMMENT='users';
+    `, 'mysql');
+    assert.ok(mysqlNoLen.findings.some((f) => f.ruleCode === 'DDL_MYSQL_VARCHAR_LEN'));
+});
+
+test('Audit C1, C2, C3, C4, A4: receipt binding, expanded PII + schema-aware views, UNPARSED_STATEMENT, MCP ping/notifications/config-sandbox, CLI --sql & positional', () => {
+    // C1: receipt binds dialect and config_sha256
+    const ddl = 'CREATE TABLE bad_t (id INT);';
+    const rA = buildReceipt({ tool: 'ddl_governance_check', rawInput: ddl, result: analyzeDdlGovernance(ddl, 'mysql'), dialect: 'mysql' });
+    const rB = buildReceipt({
+        tool: 'ddl_governance_check',
+        rawInput: ddl,
+        result: analyzeDdlGovernance(ddl, 'mysql', { config: { disabledRules: ['DDL_MISSING_PK'] } }),
+        dialect: 'mysql',
+        config: { disabledRules: ['DDL_MISSING_PK'] },
+    });
+    assert.equal(rA.dialect, 'mysql');
+    assert.equal(rA.config_sha256.length, 64);
+    assert.equal(rA.context_sha256.length, 64);
+    assert.notEqual(rA.config_sha256, rB.config_sha256);
+    assert.notEqual(rA.context_sha256, rB.context_sha256);
+
+    // C2: expanded PII dictionary + Chinese columns + multi-schema collision prevention + default CREATE VIEW
+    const pii = scanSensitiveMasking(`
+        CREATE TABLE a.customer (
+            id BIGINT PRIMARY KEY,
+            first_name VARCHAR(64),
+            last_name VARCHAR(64),
+            birth_date DATE,
+            salary DECIMAL(12,2),
+            openid VARCHAR(64),
+            salt VARCHAR(32),
+            account_no VARCHAR(32),
+            手机号 VARCHAR(20)
+        );
+        CREATE TABLE b.customer (
+            id BIGINT PRIMARY KEY,
+            email VARCHAR(128)
+        );
+    `, 'postgresql');
+    assert.equal(pii.ok, true);
+    assert.equal(pii.tables[0].sensitiveColumnCount, 8, 'All 8 PII columns in a.customer detected');
+    assert.equal(pii.maskingViews.length, 2);
+    assert.equal(pii.maskingViews[0].viewName, 'a.v_masked_customer');
+    assert.equal(pii.maskingViews[1].viewName, 'b.v_masked_customer');
+    assert.match(pii.maskingViews[0].sql, /^CREATE VIEW "a"\."v_masked_customer" AS/);
+    assert.match(pii.maskingViews[0].sql, /FROM "a"\."customer";/);
+    assert.doesNotMatch(pii.maskingViews[0].sql, /OR REPLACE/);
+
+    // C3: UNLOGGED TABLE is parsed & scored; unrecognized statements (e.g. CTAS) fail explicitly with UNPARSED_STATEMENT
+    const unlogged = analyzeDdlGovernance("CREATE TABLE good (id BIGINT PRIMARY KEY COMMENT 'pk', created_at DATETIME COMMENT 'c') COMMENT='g';\nCREATE UNLOGGED TABLE bad (pay_amount FLOAT);", 'postgresql');
+    assert.equal(unlogged.ok, true);
+    assert.equal(unlogged.tableCount, 2);
+    assert.ok(unlogged.counts.p0 >= 2, 'UNLOGGED table with float money & no PK must report P0');
+    const ctas = analyzeDdlGovernance("CREATE TABLE good (id BIGINT PRIMARY KEY COMMENT 'pk', created_at DATETIME COMMENT 'c') COMMENT='g';\nCREATE TABLE bad_ctas AS SELECT 1 AS pay_amount;", 'postgresql');
+    assert.equal(ctas.ok, false);
+    assert.equal(ctas.errorCode, 'UNPARSED_STATEMENT');
+
+    // C4: MCP ping, notifications silence, and config path rejection
+    assert.deepEqual(handleJsonRpcRequest({ jsonrpc: '2.0', id: 99, method: 'ping' }), { jsonrpc: '2.0', id: 99, result: {} });
+    assert.equal(handleJsonRpcRequest({ jsonrpc: '2.0', method: 'notifications/cancelled', params: {} }), null);
+    const cfgPathAttempt = handleJsonRpcRequest({
+        jsonrpc: '2.0',
+        id: 100,
+        method: 'tools/call',
+        params: { name: 'sql_readonly_review', arguments: { sql: 'SELECT 1;', dialect: 'postgresql', config: '/etc/passwd' } },
+    });
+    assert.equal(cfgPathAttempt.result.isError, true);
+    const cfgPathParsed = JSON.parse(cfgPathAttempt.result.content[0].text);
+    assert.equal(cfgPathParsed.result.errorCode, 'INVALID_CONFIG');
+    assert.doesNotMatch(cfgPathParsed.result.message, /root:/, 'Must never read or leak file contents');
+
+    // A4: CLI supports --sql and positional file path
+    const cliPath = path.join(PKG_ROOT, 'bin', 'cli.mjs');
+    const cliSql = spawnSync(process.execPath, [cliPath, 'sql-review', '--dialect', 'postgresql', '--sql', 'EXPLAIN ANALYZE DELETE FROM orders;'], { encoding: 'utf8' });
+    assert.equal(cliSql.status, 1);
+    assert.equal(JSON.parse(cliSql.stdout).readonlySafe, false);
+
+    const cliPositional = spawnSync(process.execPath, [cliPath, 'ddl-check', '--dialect', 'postgresql', '--receipt', path.join(FIXTURES_DIR, 'pg17-dump.sql')], { encoding: 'utf8' });
+    assert.equal(cliPositional.status, 1);
+    assert.equal(JSON.parse(cliPositional.stdout).result.tableCount, 3);
 });

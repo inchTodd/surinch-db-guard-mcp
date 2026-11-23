@@ -1,4 +1,8 @@
-import { SUPPORTED_DDL_DIALECTS, parseDdlTables } from './ddl-parser.mjs';
+import {
+    SUPPORTED_DDL_DIALECTS,
+    findUnparsedDdlStatements,
+    parseDdlTables,
+} from './ddl-parser.mjs';
 import { analyzeAlterLockRisks } from './alter-lock-check.mjs';
 import { applyRuleConfig, resolveConfig } from './config.mjs';
 
@@ -31,10 +35,30 @@ export function analyzeDdlGovernance(rawSql, dialect = 'mysql', options = {}) {
     }
 
     const parsedTables = parseDdlTables(trimmed, normalizedDialect);
-    const alterAnalysis = analyzeAlterLockRisks(trimmed, normalizedDialect);
+    const alterAnalysis = analyzeAlterLockRisks(trimmed, normalizedDialect, { dbVersion: options?.dbVersion });
+    const unparsedStatements = findUnparsedDdlStatements(trimmed);
 
     if (parsedTables.length === 0 && alterAnalysis.alterStatementCount === 0) {
+        // Distinguish unsupported CREATE TABLE variants (e.g. CTAS) from non-DDL input
+        if (unparsedStatements.some((u) => u.isCreateTableVariant)) {
+            return {
+                ok: false,
+                errorCode: 'UNPARSED_STATEMENT',
+                message: `Unsupported or unparsed DDL statement detected: "${unparsedStatements[0].preview}".`,
+                unparsedStatements,
+            };
+        }
         return { ok: false, errorCode: 'NO_CREATE_TABLE', message: 'No valid CREATE TABLE or ALTER TABLE statement found.' };
+    }
+
+    // Never silently ignore unrecognized statements alongside valid DDL (eliminates C3 false green)
+    if (unparsedStatements.length > 0) {
+        return {
+            ok: false,
+            errorCode: 'UNPARSED_STATEMENT',
+            message: `Found ${unparsedStatements.length} unrecognized/unparsed statement(s) that cannot be safely scored (first: "${unparsedStatements[0].preview}").`,
+            unparsedStatements,
+        };
     }
 
     const tables = [];
@@ -143,6 +167,7 @@ export function analyzeDdlGovernance(rawSql, dialect = 'mysql', options = {}) {
         }
 
         tables.push({
+            schema: pt.schema,
             name: tableName,
             columnCount: cols.length,
             hasPrimaryKey: hasPk,
@@ -168,6 +193,7 @@ export function analyzeDdlGovernance(rawSql, dialect = 'mysql', options = {}) {
         lockFindings.filter((f) => f.severity === 'P2').length * 5;
 
     let dimensions;
+    let baseScore;
     let totalScore;
 
     if (tables.length > 0) {
@@ -180,14 +206,18 @@ export function analyzeDdlGovernance(rawSql, dialect = 'mysql', options = {}) {
         const typeScore = Math.max(0, Math.round(100 - (totalTypeIssues / safeCols) * 200));
 
         dimensions = [
-            { key: 'naming', weightPct: 25, score: namingScore, weighted: Number((namingScore * 0.25).toFixed(2)) },
-            { key: 'comments', weightPct: 20, score: commentScore, weighted: Number((commentScore * 0.2).toFixed(2)) },
-            { key: 'primaryKey', weightPct: 20, score: pkScore, weighted: Number((pkScore * 0.2).toFixed(2)) },
-            { key: 'monitoring', weightPct: 20, score: monitoringScore, weighted: Number((monitoringScore * 0.2).toFixed(2)) },
-            { key: 'types', weightPct: 15, score: typeScore, weighted: Number((typeScore * 0.15).toFixed(2)) },
+            { key: 'naming', weightPct: 25, score: namingScore, weighted: Number((namingScore * 25) / 100) },
+            { key: 'comments', weightPct: 20, score: commentScore, weighted: Number((commentScore * 20) / 100) },
+            { key: 'primaryKey', weightPct: 20, score: pkScore, weighted: Number((pkScore * 20) / 100) },
+            { key: 'monitoring', weightPct: 20, score: monitoringScore, weighted: Number((monitoringScore * 20) / 100) },
+            { key: 'types', weightPct: 15, score: typeScore, weighted: Number((typeScore * 15) / 100) },
         ];
-        totalScore = Math.max(0, Math.round(dimensions.reduce((acc, d) => acc + d.weighted, 0)) - lockPenalty);
+        // Exact integer arithmetic to match verifiable-core verifyRecompute with zero IEEE-754 drift
+        const exactNumerator = dimensions.reduce((acc, d) => acc + d.score * d.weightPct, 0);
+        baseScore = Math.round(exactNumerator / 100);
+        totalScore = Math.max(0, baseScore - lockPenalty);
     } else {
+        baseScore = 100;
         totalScore = Math.max(0, 100 - lockPenalty);
         dimensions = [
             { key: 'alterLockSafety', weightPct: 100, score: totalScore, weighted: totalScore },
@@ -200,6 +230,8 @@ export function analyzeDdlGovernance(rawSql, dialect = 'mysql', options = {}) {
         tableCount: tables.length,
         alterStatementCount: alterAnalysis.alterStatementCount,
         columnCount: totalCols,
+        baseScore,
+        lockPenalty,
         totalScore,
         dimensions,
         tables,

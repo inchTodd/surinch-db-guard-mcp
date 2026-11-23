@@ -200,3 +200,20 @@ export function applyRuleConfig(findings, config) {
     }
     return result;
 }
+
+export function serializeConfigForHash(configInput) {
+    const resolved = resolveConfig(configInput);
+    const cfg = resolved.ok ? resolved.config : EMPTY_CONFIG;
+    return {
+        disabledRules: [...(cfg.disabledRules || [])].sort(),
+        severityOverrides: Object.fromEntries(
+            Object.entries(cfg.severityOverrides || {}).sort(([a], [b]) => a.localeCompare(b))
+        ),
+        customSensitivePatterns: (cfg.customSensitivePatterns || []).map((p) => ({
+            level: p.level,
+            pattern: p.pattern,
+            label: p.category || p.ruleCode,
+            strategy: p.strategy,
+        })),
+    };
+}

@@ -36,7 +36,7 @@ function computeFileVerdict(res) {
     return 'PASS';
 }
 
-export function scanDirectoryBatch({ command, dirPath, dialect = 'mysql', viewPrefix = 'v_masked_', config }) {
+export function scanDirectoryBatch({ command, dirPath, dialect = 'mysql', viewPrefix = 'v_masked_', replaceView = false, config }) {
     const toolName = TOOL_MAP[command];
     if (!toolName) {
         const result = {
@@ -44,18 +44,18 @@ export function scanDirectoryBatch({ command, dirPath, dialect = 'mysql', viewPr
             errorCode: 'UNKNOWN_COMMAND',
             message: `Unknown command "${command}". Supported: ddl-check, sql-review, mask-scan.`,
         };
-        return { result, receipt: buildReceipt({ tool: 'batch_scan', rawInput: '', result }) };
+        return { result, receipt: buildReceipt({ tool: 'batch_scan', rawInput: '', result, dialect }) };
     }
 
     const cfgRes = resolveConfig(config);
     if (!cfgRes.ok) {
-        return { result: cfgRes, receipt: buildReceipt({ tool: toolName, rawInput: '', result: cfgRes }) };
+        return { result: cfgRes, receipt: buildReceipt({ tool: toolName, rawInput: '', result: cfgRes, dialect }) };
     }
     const resolvedConfig = cfgRes.config;
 
     if (!dirPath || typeof dirPath !== 'string' || !dirPath.trim()) {
         const result = { ok: false, errorCode: 'INVALID_DIR', message: 'Directory path is empty.' };
-        return { result, receipt: buildReceipt({ tool: toolName, rawInput: '', result }) };
+        return { result, receipt: buildReceipt({ tool: toolName, rawInput: '', result, dialect, config: resolvedConfig }) };
     }
 
     let stat;
@@ -63,11 +63,11 @@ export function scanDirectoryBatch({ command, dirPath, dialect = 'mysql', viewPr
         stat = fs.statSync(dirPath);
     } catch (err) {
         const result = { ok: false, errorCode: 'INVALID_DIR', message: `Directory not found: "${dirPath}" (${err.message}).` };
-        return { result, receipt: buildReceipt({ tool: toolName, rawInput: '', result }) };
+        return { result, receipt: buildReceipt({ tool: toolName, rawInput: '', result, dialect, config: resolvedConfig }) };
     }
     if (!stat.isDirectory()) {
         const result = { ok: false, errorCode: 'INVALID_DIR', message: `Path is not a directory: "${dirPath}".` };
-        return { result, receipt: buildReceipt({ tool: toolName, rawInput: '', result }) };
+        return { result, receipt: buildReceipt({ tool: toolName, rawInput: '', result, dialect, config: resolvedConfig }) };
     }
 
     const discovered = collectSqlFiles(dirPath);
@@ -79,7 +79,7 @@ export function scanDirectoryBatch({ command, dirPath, dialect = 'mysql', viewPr
             errorCode: 'EMPTY_DIR',
             message: `No .sql files found in directory "${dirPath}".`,
         };
-        return { result, receipt: buildReceipt({ tool: toolName, rawInput: '', result }) };
+        return { result, receipt: buildReceipt({ tool: toolName, rawInput: '', result, dialect, config: resolvedConfig }) };
     }
 
     const perFileResults = [];
@@ -103,7 +103,7 @@ export function scanDirectoryBatch({ command, dirPath, dialect = 'mysql', viewPr
         } else if (command === 'sql-review') {
             fileResult = reviewSqlReadonly(content, dialect, { config: resolvedConfig });
         } else {
-            fileResult = scanSensitiveMasking(content, dialect, { viewPrefix, config: resolvedConfig });
+            fileResult = scanSensitiveMasking(content, dialect, { viewPrefix, replaceView, config: resolvedConfig });
         }
 
         const verdict = computeFileVerdict(fileResult);
@@ -149,7 +149,7 @@ export function scanDirectoryBatch({ command, dirPath, dialect = 'mysql', viewPr
     };
 
     const rawInput = canonicalChunks.join('\n');
-    const receipt = buildReceipt({ tool: toolName, rawInput, result: aggregateResult });
+    const receipt = buildReceipt({ tool: toolName, rawInput, result: aggregateResult, dialect, config: resolvedConfig });
 
     return { result: aggregateResult, receipt };
 }
