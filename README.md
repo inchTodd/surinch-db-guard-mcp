@@ -5,6 +5,8 @@
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](./LICENSE)
 [![Node.js](https://img.shields.io/badge/node-%3E%3D20.0.0-brightgreen.svg)](https://nodejs.org)
 [![Zero Dependencies](https://img.shields.io/badge/dependencies-0-success.svg)](#)
+[![MCP Registry](https://img.shields.io/badge/MCP_Registry-active-0f766e.svg)](https://registry.modelcontextprotocol.io/v0/servers/io.github.inchTodd%2Fsurinch-db-guard-mcp)
+[![inchTodd/surinch-db-guard-mcp MCP server](https://glama.ai/mcp/servers/inchTodd/surinch-db-guard-mcp/badges/score.svg)](https://glama.ai/mcp/servers/inchTodd/surinch-db-guard-mcp)
 
 `@surinch/db-guard-mcp` gives AI coding agents (Cursor, Claude Desktop, Windsurf, Antigravity, DSH) and CI pipelines a **deterministic, zero-hallucination database safety boundary**. Everything runs locally in Node.js with zero external network calls, zero database write privileges, and cryptographically reproducible `surinch.receipt.h1` SHA-256 audit receipts.
 

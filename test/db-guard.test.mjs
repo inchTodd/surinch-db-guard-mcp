@@ -793,4 +793,8 @@ test('Audit C1, C2, C3, C4, A4: receipt binding, expanded PII + schema-aware vie
     const cliPositional = spawnSync(process.execPath, [cliPath, 'ddl-check', '--dialect', 'postgresql', '--receipt', path.join(FIXTURES_DIR, 'pg17-dump.sql')], { encoding: 'utf8' });
     assert.equal(cliPositional.status, 1);
     assert.equal(JSON.parse(cliPositional.stdout).result.tableCount, 3);
+
+    // Official MCP Registry schema constraint: server.json description must be <= 100 chars
+    const serverManifest = JSON.parse(fs.readFileSync(path.join(PKG_ROOT, 'server.json'), 'utf8'));
+    assert.ok(serverManifest.description.length > 0 && serverManifest.description.length <= 100, 'server.json description must be <= 100 chars for MCP Registry');
 });
